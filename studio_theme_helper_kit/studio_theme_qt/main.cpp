@@ -29,7 +29,9 @@
 #include <memory>
 #include <variant>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <vector>
 #include <thread>
 #include <utility>
 
@@ -45,6 +47,10 @@ class studio_theme_qt final : public ModBase
 	std::mutex m_register_mutex;
 	bool m_registered = false;
 	std::atomic<bool> m_stop{false};
+	uint64_t m_menu_root = 0;
+	uint64_t m_menu_presets = 0;
+	std::vector<uint64_t> m_preset_items;
+	std::string m_last_presets;
 
 public:
 	studio_theme_qt()
@@ -62,6 +68,7 @@ public:
 	void on_load() override
 	{
 		m_log->info("loaded");
+		build_menu();
 		if (register_bridge())
 		{
 			return;
@@ -145,6 +152,23 @@ public:
 			m_log->error("couldn't register pick_image: {}", picked.error());
 		}
 
+		auto presets = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
+			std::string names;
+			if (!args.empty())
+			{
+				if (const auto* text = std::get_if<std::string>(&args[0]))
+				{
+					names = *text;
+				}
+			}
+			schedule_presets(std::move(names));
+			return {true};
+		});
+		if (!presets)
+		{
+			m_log->error("couldn't register set_presets: {}", presets.error());
+		}
+
 		auto pinged = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
 			return {true};
 		});
@@ -160,10 +184,15 @@ public:
 	void on_unload() override
 	{
 		m_stop = true;
+		if (auto* qt = rml::qt::QtIntegration::instance(); qt && m_menu_root != 0)
+		{
+			qt->menu().remove(m_menu_root);
+			m_menu_root = 0;
+		}
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "set_presets", "ping"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)
@@ -177,6 +206,93 @@ public:
 	}
 
 private:
+	// ===== Mods > Studio Theme menu =====
+	// Clicks are sent to the theme scripts as bridge event "studio_theme.menu"
+	// with an action string ("open", "toggle", "preset:<name>", ...).
+	void send(const std::string& action)
+	{
+		auto* runtime = script_runtime();
+		if (!runtime)
+		{
+			m_log->warn("menu: script runtime not ready");
+			return;
+		}
+		auto emitted = runtime->bridge().emit("studio_theme.menu", BridgeArgs{action});
+		if (!emitted)
+		{
+			m_log->warn("menu: couldn't send '{}': {}", action, emitted.error());
+		}
+	}
+
+	void build_menu()
+	{
+		auto* qt = rml::qt::QtIntegration::instance();
+		if (!qt)
+		{
+			m_log->warn("Qt integration unavailable; no Mods > Studio Theme menu");
+			return;
+		}
+		auto& menu = qt->menu();
+		m_menu_root = menu.add_submenu(0, "Studio Theme");
+		if (m_menu_root == 0)
+		{
+			return;
+		}
+		menu.add_action(m_menu_root, "Open / close Theme Editor", [this]() { send("open"); });
+		menu.add_action(m_menu_root, "Turn theme on / off", [this]() { send("toggle"); });
+		menu.add_separator(m_menu_root);
+		m_menu_presets = menu.add_submenu(m_menu_root, "Presets");
+		m_preset_items.push_back(menu.add_action(m_menu_presets, "(loading...)", []() {}));
+		menu.add_separator(m_menu_root);
+		menu.add_action(m_menu_root, "Auto-match leftover colors on / off", [this]() { send("automatch"); });
+		menu.add_action(m_menu_root, "Reload background images", [this]() { send("reload_images"); });
+		menu.add_action(m_menu_root, "Re-apply theme everywhere", [this]() { send("refresh"); });
+		menu.add_separator(m_menu_root);
+		menu.add_action(m_menu_root, "Plain Studio (remove all theme colors)", [this]() { send("plain"); });
+	}
+
+	// names: preset names separated by newlines (sent by the theme scripts)
+	void schedule_presets(std::string names)
+	{
+		auto task = [this, names = std::move(names)]() {
+			auto* qt = rml::qt::QtIntegration::instance();
+			if (!qt || m_menu_presets == 0 || names == m_last_presets)
+			{
+				return;
+			}
+			m_last_presets = names;
+			auto& menu = qt->menu();
+			for (const auto id : m_preset_items)
+			{
+				menu.remove(id);
+			}
+			m_preset_items.clear();
+			std::istringstream lines(names);
+			std::string name;
+			while (std::getline(lines, name))
+			{
+				if (!name.empty() && name.back() == '\r')
+				{
+					name.pop_back();
+				}
+				if (name.empty())
+				{
+					continue;
+				}
+				m_preset_items.push_back(menu.add_action(m_menu_presets, name, [this, name]() { send("preset:" + name); }));
+			}
+			m_log->info("Mods menu: {} presets", m_preset_items.size());
+		};
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
+	}
+
 	// Count every live Qt widget by class and hand the list to the scripts:
 	// shared value "studio_theme.qt_scan" (JSON) + event "studio_theme.qt_scan_done".
 	void schedule_scan()

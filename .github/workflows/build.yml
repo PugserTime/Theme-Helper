@@ -1,0 +1,86 @@
+# Builds the Studio Theme native helper (and optionally RML with the
+# drag-crash fix) on GitHub's Windows servers. Nothing to install locally.
+name: Build Studio Theme helper
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      rml_ref:
+        description: "Your RML version (first line of your RML log, e.g. 17589c0)"
+        required: true
+        default: "17589c0"
+      crash_fix:
+        description: "Also build roblox_modloader.dll with the drag/resize crash fix"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get this kit
+        uses: actions/checkout@v4
+        with:
+          path: kit
+
+      - name: Get RML source (same version you run)
+        shell: pwsh
+        run: |
+          $ref = "${{ github.event.inputs.rml_ref }}"
+          if (-not $ref) { $ref = "17589c0" }
+          git clone https://github.com/revolutionxk/roblox-modloader.git rml
+          cd rml
+          git checkout $ref
+          git submodule update --init --recursive
+
+      - name: Add the helper (+ crash fix)
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse kit/studio_theme_qt rml/examples/studio_theme_qt
+          $fix = "${{ github.event.inputs.crash_fix }}"
+          if ($fix -ne "false") {
+            Push-Location rml
+            git apply --whitespace=nowarn ../kit/rml_crash_dumper_fix.patch
+            if ($LASTEXITCODE -ne 0) { Write-Warning "crash fix didn't apply to this RML version - building without it"; git checkout -- . }
+            Pop-Location
+          }
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: seanmiddleditch/gha-setup-ninja@master
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        shell: pwsh
+        working-directory: rml
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+          cmake --build build --parallel --target roblox_modloader studio_theme_qt
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "out/RobloxModLoader/mods/studio_theme/native" | Out-Null
+          $helper = Get-ChildItem rml/build -Recurse -Filter studio_theme_qt.dll | Select-Object -First 1
+          if (-not $helper) { throw "studio_theme_qt.dll wasn't built" }
+          Copy-Item $helper.FullName "out/RobloxModLoader/mods/studio_theme/native/"
+          if ("${{ github.event.inputs.crash_fix }}" -ne "false") {
+            $loader = Get-ChildItem rml/build -Recurse -Filter roblox_modloader.dll | Select-Object -First 1
+            if ($loader) { Copy-Item $loader.FullName "out/RobloxModLoader/" }
+          }
+          Set-Content out/INSTALL.txt @"
+          Close Studio, then copy the RobloxModLoader folder from this zip on top of
+          your existing one:  ...\Roblox\Versions\version-xxxx\RobloxModLoader
+          (say Yes to replace). Back up roblox_modloader.dll first if you like.
+          "@
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: studio-theme-helper
+          path: out

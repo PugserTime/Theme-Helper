@@ -21,6 +21,8 @@
 #include <RobloxModLoader/qt/qwidget.hpp>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <map>
@@ -28,6 +30,7 @@
 #include <variant>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 using namespace rml::luau;
@@ -39,6 +42,9 @@ class studio_theme_qt final : public ModBase
 	std::string m_original;
 	std::string m_last;
 	bool m_captured = false;
+	std::mutex m_register_mutex;
+	bool m_registered = false;
+	std::atomic<bool> m_stop{false};
 
 public:
 	studio_theme_qt()
@@ -50,18 +56,49 @@ public:
 		m_log = rml::Logger::get_logger("StudioThemeQt");
 	}
 
+	// NOTE: RML 17589c0 declares on_script_manager_load() but never calls it,
+	// so the bridge functions are registered from on_load() instead, with a
+	// background retry in case the script runtime isn't up yet.
 	void on_load() override
 	{
 		m_log->info("loaded");
+		if (register_bridge())
+		{
+			return;
+		}
+		m_stop = false;
+		std::thread([this]() {
+			for (int attempt = 0; attempt < 240 && !m_stop; ++attempt)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				if (register_bridge())
+				{
+					return;
+				}
+			}
+			if (!m_stop)
+			{
+				m_log->error("gave up waiting for the script runtime; the theme scripts can't reach this helper");
+			}
+		}).detach();
 	}
 
 	void on_script_manager_load() override
 	{
+		register_bridge();
+	}
+
+	bool register_bridge()
+	{
+		std::lock_guard guard(m_register_mutex);
+		if (m_registered)
+		{
+			return true;
+		}
 		auto* runtime = script_runtime();
 		if (!runtime)
 		{
-			m_log->error("script runtime unavailable; the theme scripts can't reach this helper");
-			return;
+			return false;
 		}
 		auto& bridge = runtime->bridge();
 
@@ -115,11 +152,26 @@ public:
 		{
 			m_log->error("couldn't register ping: {}", pinged.error());
 		}
-		m_log->info("bridge functions registered");
+		m_registered = true;
+		m_log->info("bridge functions registered - the Studio Theme scripts can use this helper now");
+		return true;
 	}
 
 	void on_unload() override
 	{
+		m_stop = true;
+		if (auto* runtime = script_runtime(); runtime && m_registered)
+		{
+			auto& bridge = runtime->bridge();
+			for (const char* fn : {"apply", "scan", "pick_image", "ping"})
+			{
+				auto removed = bridge.unregister_function("studio_theme_qt", fn);
+				if (!removed)
+				{
+					m_log->debug("unregister {}: {}", fn, removed.error());
+				}
+			}
+		}
 		schedule(std::string{});
 		m_log->info("unloaded, Qt stylesheet restored");
 	}

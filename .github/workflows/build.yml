@@ -37,14 +37,29 @@ jobs:
       - name: Add the helper (+ crash fix)
         shell: pwsh
         run: |
-          Copy-Item -Recurse kit/studio_theme_qt rml/examples/studio_theme_qt
+          # Find the files wherever GitHub's uploader put them (top level,
+          # inside studio_theme_qt/, or inside studio_theme_helper_kit/...).
+          Write-Host "Files in your repo:"
+          Get-ChildItem kit -Recurse -File | Where-Object { $_.FullName -notmatch '\\.git\\' } | ForEach-Object { Write-Host "  $($_.FullName.Substring((Resolve-Path kit).Path.Length))" }
+          $main = Get-ChildItem kit -Recurse -Filter main.cpp -File |
+            Where-Object { Select-String -Path $_.FullName -Pattern 'studio_theme_qt' -Quiet } |
+            Select-Object -First 1
+          if (-not $main) { throw "Couldn't find main.cpp in your repo. Upload the main.cpp file from the studio_theme_qt folder (Add file > Upload files), then run this again." }
+          Write-Host "Using $($main.FullName)"
+          New-Item -ItemType Directory -Force rml/examples/studio_theme_qt | Out-Null
+          Copy-Item $main.FullName rml/examples/studio_theme_qt/main.cpp
+
           $fix = "${{ github.event.inputs.crash_fix }}"
-          if ($fix -ne "false") {
+          $patch = Get-ChildItem kit -Recurse -Filter *.patch -File | Select-Object -First 1
+          if ($fix -ne "false" -and $patch) {
             Push-Location rml
-            git apply --whitespace=nowarn ../kit/rml_crash_dumper_fix.patch
-            if ($LASTEXITCODE -ne 0) { Write-Warning "crash fix didn't apply to this RML version - building without it"; git checkout -- . }
+            git apply --whitespace=nowarn $patch.FullName
+            if ($LASTEXITCODE -ne 0) { Write-Warning "crash fix didn't apply to this RML version - building without it"; git checkout -- . ; $global:LASTEXITCODE = 0 }
             Pop-Location
+          } elseif ($fix -ne "false") {
+            Write-Warning "rml_crash_dumper_fix.patch not found in your repo - building without the crash fix"
           }
+          exit 0
 
       - uses: actions/setup-dotnet@v4
         with:

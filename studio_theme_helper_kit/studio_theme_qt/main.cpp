@@ -6,8 +6,6 @@
 // so the scripts build a Qt stylesheet and hand it over the bridge:
 //
 //     bridge.call("studio_theme_qt", "apply", cssText)   -- "" = restore
-//     bridge.call("studio_theme_qt", "install_image", file, contentDir)
-//                                       -- copy an image into Studio's content\studio_theme\
 //
 // Studio's own stylesheet is captured once and always kept underneath ours,
 // and it's put back when the mod unloads.
@@ -17,12 +15,17 @@
 #include <RobloxModLoader/luau/script_runtime.hpp>
 #include <RobloxModLoader/mod/mod_base.hpp>
 #include <RobloxModLoader/qt/qapplication.hpp>
+#include <RobloxModLoader/qt/qcolor.hpp>
 #include <RobloxModLoader/qt/qfiledialog.hpp>
+#include <RobloxModLoader/qt/qpainter.hpp>
+#include <RobloxModLoader/qt/qpixmap.hpp>
+#include <RobloxModLoader/qt/qrect.hpp>
 #include <RobloxModLoader/qt/qobject.hpp>
 #include <RobloxModLoader/qt/qt_integration.hpp>
 #include <RobloxModLoader/qt/qwidget.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -53,6 +56,8 @@ class studio_theme_qt final : public ModBase
 	uint64_t m_menu_presets = 0;
 	std::vector<uint64_t> m_preset_items;
 	std::string m_last_presets;
+	int m_compose_counter = 0;
+	std::string m_last_compose;
 
 public:
 	studio_theme_qt()
@@ -154,65 +159,54 @@ public:
 			m_log->error("couldn't register pick_image: {}", picked.error());
 		}
 
-		// install_image(sourcePath, contentDir): copy an image into Studio's own
-		// content\\studio_theme\\ folder so it loads as rbxasset://studio_theme/<name>
-		// (the one route Studio always supports, even when RML's loader is broken).
-		// Answers { "rbxasset://studio_theme/<name>" } or { "", "<error>" }.
+		// install_image(sourcePath, studioContentDir) -> rbxasset id, error
+		// Copies an image into Studio's own content folder so it loads through
+		// rbxasset:// - works even when RML's temporary-id image loading can't
+		// find its engine functions on this Studio build.
 		auto installed = bridge.register_function("studio_theme_qt", "install_image", [this](const BridgeArgs& args) -> BridgeArgs {
-			namespace fs = std::filesystem;
-			std::string source_text;
-			std::string content_text;
-			if (args.size() > 0)
+			const auto* src = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
+			const auto* content = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
+			if (!src || !content || src->empty() || content->empty())
 			{
-				if (const auto* text = std::get_if<std::string>(&args[0]))
-				{
-					source_text = *text;
-				}
+				return {std::string{}, std::string{"missing arguments"}};
 			}
-			if (args.size() > 1)
-			{
-				if (const auto* text = std::get_if<std::string>(&args[1]))
-				{
-					content_text = *text;
-				}
-			}
-			if (source_text.empty() || content_text.empty())
-			{
-				return BridgeArgs{std::string{}, std::string{"install_image needs a file path and Studio's content folder"}};
-			}
-			std::error_code ec;
-			const fs::path source = from_utf8(source_text);
-			if (!fs::exists(source, ec) || !fs::is_regular_file(source, ec))
-			{
-				return BridgeArgs{std::string{}, std::string{"file not found: "} + source_text};
-			}
-			const fs::path folder = from_utf8(content_text) / "studio_theme";
-			ec.clear();
-			fs::create_directories(folder, ec);
-			if (ec)
-			{
-				m_log->warn("install_image: couldn't create {}: {}", utf8(folder), ec.message());
-				return BridgeArgs{std::string{}, std::string{"couldn't create the studio_theme content folder: "} + ec.message()};
-			}
-			const fs::path target = folder / source.filename();
-			ec.clear();
-			const bool same = fs::exists(target, ec) && fs::equivalent(source, target, ec);
-			if (!same)
-			{
-				ec.clear();
-				fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
-				if (ec)
-				{
-					m_log->warn("install_image: couldn't copy to {}: {}", utf8(target), ec.message());
-					return BridgeArgs{std::string{}, std::string{"couldn't copy the image into Studio's content folder: "} + ec.message()};
-				}
-			}
-			m_log->info("install_image: {} -> {}", source_text, utf8(target));
-			return BridgeArgs{std::string{"rbxasset://studio_theme/"} + utf8(source.filename())};
+			return install_image(*src, *content);
 		});
 		if (!installed)
 		{
 			m_log->error("couldn't register install_image: {}", installed.error());
+		}
+
+		// compose_topbar(image, "#RRGGBB", opacity 0-1, mode, outDir, key)
+		// Renders the menu-bar background: image scaled to the bar's real size
+		// (Crop = cover + center crop), blended at `opacity` over the color.
+		// Async: answers with shared "studio_theme.topbar_image" + event
+		// "studio_theme.topbar_ready".
+		auto composed = bridge.register_function("studio_theme_qt", "compose_topbar", [this](const BridgeArgs& args) -> BridgeArgs {
+			auto text = [&](std::size_t i) -> std::string {
+				if (i < args.size())
+				{
+					if (const auto* v = std::get_if<std::string>(&args[i]))
+					{
+						return *v;
+					}
+				}
+				return {};
+			};
+			double opacity = 1.0;
+			if (args.size() > 2)
+			{
+				if (const auto* d = std::get_if<double>(&args[2]))
+				{
+					opacity = *d;
+				}
+			}
+			schedule_compose(text(0), text(1), opacity, text(3), text(4), text(5));
+			return {true};
+		});
+		if (!composed)
+		{
+			m_log->error("couldn't register compose_topbar: {}", composed.error());
 		}
 
 		auto presets = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
@@ -255,7 +249,7 @@ public:
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "set_presets", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "set_presets", "ping"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)
@@ -442,6 +436,172 @@ private:
 	static std::filesystem::path from_utf8(const std::string& text)
 	{
 		return std::filesystem::path(std::u8string(text.begin(), text.end()));
+	}
+
+	static rml::qt::QColor parse_hex(const std::string& hex)
+	{
+		unsigned int value = 0x202020;
+		if (hex.size() >= 7 && hex[0] == '#')
+		{
+			value = static_cast<unsigned int>(std::stoul(hex.substr(1, 6), nullptr, 16));
+		}
+		return rml::qt::QColor(static_cast<int>((value >> 16) & 0xFF), static_cast<int>((value >> 8) & 0xFF), static_cast<int>(value & 0xFF));
+	}
+
+	void schedule_compose(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir, std::string key)
+	{
+		auto task = [this, image, hex, opacity, mode, out_dir, key]() {
+			namespace fs = std::filesystem;
+			std::string result;
+			std::string error;
+			// the menu bar's real size (logical px), rendered at 2x for sharpness
+			int w = 0;
+			int h = 0;
+			for (auto* widget : rml::qt::QApplication::all_widgets())
+			{
+				if (!widget)
+				{
+					continue;
+				}
+				const char* cls = widget->class_name();
+				if (cls && std::string_view(cls).find("MenuBar") != std::string_view::npos && widget->width() > w)
+				{
+					w = widget->width();
+					h = widget->height();
+				}
+			}
+			if (w <= 0 || h <= 0)
+			{
+				w = 1920;
+				h = 32;
+			}
+			const int W = w * 2;
+			const int H = h * 2;
+			rml::qt::QPixmap source(image);
+			if (!source.loaded() || source.width() <= 0 || source.height() <= 0)
+			{
+				error = "Qt couldn't read the image: " + image;
+			}
+			else
+			{
+				rml::qt::QPixmap canvas(W, H);
+				canvas.fill(parse_hex(hex));
+				{
+					rml::qt::QPainter painter(canvas);
+					painter.set_render_hint(rml::qt::QPainter::SmoothPixmapTransform);
+					painter.set_opacity(std::clamp(opacity, 0.0, 1.0));
+					using Aspect = rml::qt::QPixmap::AspectMode;
+					if (mode == "Stretch")
+					{
+						painter.draw_pixmap(rml::qt::QRect(0, 0, W, H), source.scaled(W, H, Aspect::Ignore));
+					}
+					else if (mode == "Fit")
+					{
+						const auto fit = source.scaled(W, H, Aspect::Keep);
+						painter.draw_pixmap((W - fit.width()) / 2, (H - fit.height()) / 2, fit);
+					}
+					else if (mode == "Tile")
+					{
+						const auto tile = source.scaled(W * 4, H, Aspect::Keep);
+						for (int x = 0; tile.width() > 0 && x < W; x += tile.width())
+						{
+							painter.draw_pixmap(x, 0, tile);
+						}
+					}
+					else
+					{
+						// Crop: cover the whole bar, cut off the overflow evenly
+						const auto cover = source.scaled(W, H, Aspect::KeepByExpanding);
+						painter.draw_pixmap((W - cover.width()) / 2, (H - cover.height()) / 2, cover);
+					}
+				}
+				std::error_code ec;
+				const fs::path dir = from_utf8(out_dir);
+				fs::create_directories(dir, ec);
+				// new name each time: Qt caches stylesheet images by path
+				const fs::path file = dir / std::format("topbar_{}.png", ++m_compose_counter);
+				if (canvas.save(utf8(file)))
+				{
+					if (!m_last_compose.empty())
+					{
+						fs::remove(from_utf8(m_last_compose), ec);
+					}
+					m_last_compose = utf8(file);
+					result = m_last_compose;
+				}
+				else
+				{
+					error = "couldn't save the composed image to " + utf8(file);
+				}
+			}
+			auto* runtime = script_runtime();
+			if (!runtime)
+			{
+				return;
+			}
+			auto& bridge = runtime->bridge();
+			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}", json_escape(key), json_escape(result), json_escape(error));
+			auto stored = bridge.set_shared("studio_theme.topbar_image", json);
+			if (!stored)
+			{
+				m_log->warn("couldn't publish top bar image: {}", stored.error());
+			}
+			auto emitted = bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
+			if (!emitted)
+			{
+				m_log->warn("couldn't emit topbar_ready: {}", emitted.error());
+			}
+			m_log->info("top bar image {}x{} -> '{}' {}", W, H, result, error);
+		};
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
+	}
+
+	BridgeArgs install_image(const std::string& source_text, const std::string& content_text)
+	{
+		namespace fs = std::filesystem;
+		std::error_code ec;
+		const fs::path source = from_utf8(source_text);
+		if (!fs::is_regular_file(source, ec))
+		{
+			return {std::string{}, std::string{"not found"}};
+		}
+		const fs::path content = from_utf8(content_text);
+		if (!fs::is_directory(content, ec))
+		{
+			return {std::string{}, "Studio content folder not found: " + content_text};
+		}
+		const fs::path folder = content / "studio_theme";
+		fs::create_directories(folder, ec);
+		const fs::path target = folder / source.filename();
+		ec.clear();
+		bool copy = !fs::exists(target, ec);
+		if (!copy)
+		{
+			ec.clear();
+			const auto source_size = fs::file_size(source, ec);
+			const auto target_size = fs::file_size(target, ec);
+			const auto source_time = fs::last_write_time(source, ec);
+			const auto target_time = fs::last_write_time(target, ec);
+			copy = source_size != target_size || source_time > target_time;
+		}
+		if (copy)
+		{
+			ec.clear();
+			fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
+			if (ec)
+			{
+				return {std::string{}, "couldn't copy into Studio's content folder: " + ec.message()};
+			}
+			m_log->info("installed image {} -> {}", source_text, utf8(target));
+		}
+		return {"rbxasset://studio_theme/" + utf8(source.filename()), std::string{}};
 	}
 
 	// Native file picker that starts in the mod's images folder. Anything

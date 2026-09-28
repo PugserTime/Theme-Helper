@@ -6,6 +6,8 @@
 // so the scripts build a Qt stylesheet and hand it over the bridge:
 //
 //     bridge.call("studio_theme_qt", "apply", cssText)   -- "" = restore
+//     bridge.call("studio_theme_qt", "install_image", file, contentDir)
+//                                       -- copy an image into Studio's content\studio_theme\
 //
 // Studio's own stylesheet is captured once and always kept underneath ours,
 // and it's put back when the mod unloads.
@@ -152,6 +154,67 @@ public:
 			m_log->error("couldn't register pick_image: {}", picked.error());
 		}
 
+		// install_image(sourcePath, contentDir): copy an image into Studio's own
+		// content\\studio_theme\\ folder so it loads as rbxasset://studio_theme/<name>
+		// (the one route Studio always supports, even when RML's loader is broken).
+		// Answers { "rbxasset://studio_theme/<name>" } or { "", "<error>" }.
+		auto installed = bridge.register_function("studio_theme_qt", "install_image", [this](const BridgeArgs& args) -> BridgeArgs {
+			namespace fs = std::filesystem;
+			std::string source_text;
+			std::string content_text;
+			if (args.size() > 0)
+			{
+				if (const auto* text = std::get_if<std::string>(&args[0]))
+				{
+					source_text = *text;
+				}
+			}
+			if (args.size() > 1)
+			{
+				if (const auto* text = std::get_if<std::string>(&args[1]))
+				{
+					content_text = *text;
+				}
+			}
+			if (source_text.empty() || content_text.empty())
+			{
+				return BridgeArgs{std::string{}, std::string{"install_image needs a file path and Studio's content folder"}};
+			}
+			std::error_code ec;
+			const fs::path source = from_utf8(source_text);
+			if (!fs::exists(source, ec) || !fs::is_regular_file(source, ec))
+			{
+				return BridgeArgs{std::string{}, std::string{"file not found: "} + source_text};
+			}
+			const fs::path folder = from_utf8(content_text) / "studio_theme";
+			ec.clear();
+			fs::create_directories(folder, ec);
+			if (ec)
+			{
+				m_log->warn("install_image: couldn't create {}: {}", utf8(folder), ec.message());
+				return BridgeArgs{std::string{}, std::string{"couldn't create the studio_theme content folder: "} + ec.message()};
+			}
+			const fs::path target = folder / source.filename();
+			ec.clear();
+			const bool same = fs::exists(target, ec) && fs::equivalent(source, target, ec);
+			if (!same)
+			{
+				ec.clear();
+				fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
+				if (ec)
+				{
+					m_log->warn("install_image: couldn't copy to {}: {}", utf8(target), ec.message());
+					return BridgeArgs{std::string{}, std::string{"couldn't copy the image into Studio's content folder: "} + ec.message()};
+				}
+			}
+			m_log->info("install_image: {} -> {}", source_text, utf8(target));
+			return BridgeArgs{std::string{"rbxasset://studio_theme/"} + utf8(source.filename())};
+		});
+		if (!installed)
+		{
+			m_log->error("couldn't register install_image: {}", installed.error());
+		}
+
 		auto presets = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
 			std::string names;
 			if (!args.empty())
@@ -192,7 +255,7 @@ public:
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "set_presets", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "set_presets", "ping"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)

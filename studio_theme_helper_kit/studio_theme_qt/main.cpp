@@ -40,6 +40,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <thread>
 #include <utility>
 
@@ -802,6 +803,25 @@ private:
 		return std::all_of(text.begin(), text.end(), [](char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; });
 	}
 
+	static bool is_theme_target(const char* cls)
+	{
+		if (!cls || !*cls)
+			return false;
+		const std::string_view c(cls);
+		// Only touch native surfaces that Studio Theme explicitly targets.
+		// Avoid walking/re-writing arbitrary Qt children (which can create
+		// transient boxes and unnecessary repaints).
+		static constexpr std::string_view needles[] = {
+			"Output", "Properties", "Dock", "Menu", "ToolBar", "StatusBar",
+			"TabBar", "TitleBar", "Dialog", "Tooltip", "CommandBar",
+			"Header", "SystemOutput", "Qtitan"
+		};
+		for (const auto n : needles)
+			if (c.find(n) != std::string_view::npos)
+				return true;
+		return false;
+	}
+
 	void schedule_restyle(std::string css)
 	{
 		auto task = [this, css = std::move(css)]() {
@@ -810,6 +830,11 @@ private:
 			for (auto* widget : rml::qt::QApplication::all_widgets())
 			{
 				if (!widget)
+				{
+					continue;
+				}
+				const char* cls = widget->class_name();
+				if (!is_theme_target(cls))
 				{
 					continue;
 				}

@@ -34,6 +34,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <variant>
 #include <mutex>
@@ -222,8 +223,11 @@ public:
 		// colors or updated. This appends `css` to each such widget's own sheet
 		// (appended rules win). Safe to call repeatedly: our block is replaced,
 		// and new widgets (menus opened later) get picked up.
+		// Only classes in the allow-list (2nd arg, one class per line) are
+		// touched -- never Properties' editors, which also carry own sheets.
 		auto restyled = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
 			std::string css;
+			std::string allow;
 			if (!args.empty())
 			{
 				if (const auto* text = std::get_if<std::string>(&args[0]))
@@ -231,7 +235,14 @@ public:
 					css = *text;
 				}
 			}
-			schedule_restyle(std::move(css));
+			if (args.size() > 1)
+			{
+				if (const auto* text = std::get_if<std::string>(&args[1]))
+				{
+					allow = *text;
+				}
+			}
+			schedule_restyle(std::move(css), std::move(allow));
 			return {true};
 		});
 		if (!restyled)
@@ -340,7 +351,7 @@ public:
 				}
 			}
 		}
-		schedule_restyle(std::string{});
+		schedule_restyle(std::string{}, std::string{});
 		schedule(std::string{});
 		m_log->info("unloaded, Qt stylesheet restored");
 	}
@@ -802,9 +813,31 @@ private:
 		return std::all_of(text.begin(), text.end(), [](char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; });
 	}
 
-	void schedule_restyle(std::string css)
+	// Default allow-list: the widgets whose own Studio sheet blocked the theme.
+	static constexpr std::string_view kDefaultAllow =
+	    "OutputWidgetRibbon\nOutputFilterTextEdit\nOutputFindSearchBar\nOutputRibbonCombinedFilterDropdown\n"
+	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
+	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu";
+
+	void schedule_restyle(std::string css, std::string allow_text)
 	{
-		auto task = [this, css = std::move(css)]() {
+		auto task = [this, css = std::move(css), allow_text = std::move(allow_text)]() {
+			std::set<std::string> allow;
+			{
+				std::istringstream lines(allow_text.empty() ? std::string(kDefaultAllow) : allow_text);
+				std::string line;
+				while (std::getline(lines, line))
+				{
+					if (!line.empty() && line.back() == '\r')
+					{
+						line.pop_back();
+					}
+					if (!line.empty())
+					{
+						allow.insert(line);
+					}
+				}
+			}
 			int changed = 0;
 			int owned = 0;
 			for (auto* widget : rml::qt::QApplication::all_widgets())
@@ -818,7 +851,21 @@ private:
 				{
 					continue; // no own sheet: the app-wide stylesheet already reaches it
 				}
+				const char* cls = widget->class_name();
+				const bool allowed = !css.empty() && cls && allow.count(cls) > 0;
 				const std::string base = strip_ours(own);
+				if (!allowed)
+				{
+					// not ours to touch -- also removes blocks an older version
+					// appended here (e.g. inside Properties)
+					if (base != own)
+					{
+						const rml::qt::QString sheet(base);
+						widget->setStyleSheet(sheet);
+						++changed;
+					}
+					continue;
+				}
 				if (blank(base))
 				{
 					// only our block was there (Studio cleared its sheet): drop it

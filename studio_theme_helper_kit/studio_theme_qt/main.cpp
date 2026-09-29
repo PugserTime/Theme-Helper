@@ -31,6 +31,8 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <variant>
@@ -237,6 +239,58 @@ public:
 			m_log->error("couldn't register restyle_widgets: {}", restyled.error());
 		}
 
+		// save_theme(path, text) / load_theme(path): the theme as a file in the
+		// mod folder, so the Studio half can apply it the moment Studio starts.
+		auto saved = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
+			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
+			const auto* text = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
+			if (!path || !text || path->empty())
+			{
+				return {std::string{"missing arguments"}};
+			}
+			namespace fs = std::filesystem;
+			const fs::path file = from_utf8(*path);
+			const fs::path temp = fs::path(file).concat(".tmp");
+			{
+				std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+				if (!out)
+				{
+					return {std::string{"couldn't write "} + *path};
+				}
+				out << *text;
+			}
+			std::error_code ec;
+			fs::rename(temp, file, ec); // atomic replace: never a half-written theme
+			if (ec)
+			{
+				return {"couldn't save theme: " + ec.message()};
+			}
+			return {true};
+		});
+		if (!saved)
+		{
+			m_log->error("couldn't register save_theme: {}", saved.error());
+		}
+
+		auto loaded = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
+			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
+			if (!path || path->empty())
+			{
+				return {std::string{}};
+			}
+			std::ifstream in(from_utf8(*path), std::ios::binary);
+			if (!in)
+			{
+				return {std::string{}};
+			}
+			std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+			return {text};
+		});
+		if (!loaded)
+		{
+			m_log->error("couldn't register load_theme: {}", loaded.error());
+		}
+
 		auto presets = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
 			std::string names;
 			if (!args.empty())
@@ -277,7 +331,7 @@ public:
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "set_presets", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "save_theme", "load_theme", "set_presets", "ping"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)

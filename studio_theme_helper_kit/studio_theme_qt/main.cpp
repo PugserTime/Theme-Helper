@@ -20,6 +20,7 @@
 #include <RobloxModLoader/qt/qpainter.hpp>
 #include <RobloxModLoader/qt/qpixmap.hpp>
 #include <RobloxModLoader/qt/qrect.hpp>
+#include <RobloxModLoader/qt/qstring.hpp>
 #include <RobloxModLoader/qt/qobject.hpp>
 #include <RobloxModLoader/qt/qt_integration.hpp>
 #include <RobloxModLoader/qt/qwidget.hpp>
@@ -39,6 +40,10 @@
 #include <vector>
 #include <thread>
 #include <utility>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace rml::luau;
 
@@ -209,6 +214,29 @@ public:
 			m_log->error("couldn't register compose_topbar: {}", composed.error());
 		}
 
+		// restyle_widgets(css): Studio attaches its OWN stylesheet to some widgets
+		// (Output toolbar, its menus, ...). A widget's own sheet beats the
+		// app-wide one and cascades into its children, so those never took our
+		// colors or updated. This appends `css` to each such widget's own sheet
+		// (appended rules win). Safe to call repeatedly: our block is replaced,
+		// and new widgets (menus opened later) get picked up.
+		auto restyled = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
+			std::string css;
+			if (!args.empty())
+			{
+				if (const auto* text = std::get_if<std::string>(&args[0]))
+				{
+					css = *text;
+				}
+			}
+			schedule_restyle(std::move(css));
+			return {true};
+		});
+		if (!restyled)
+		{
+			m_log->error("couldn't register restyle_widgets: {}", restyled.error());
+		}
+
 		auto presets = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
 			std::string names;
 			if (!args.empty())
@@ -249,7 +277,7 @@ public:
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "set_presets", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "set_presets", "ping"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)
@@ -258,6 +286,7 @@ public:
 				}
 			}
 		}
+		schedule_restyle(std::string{});
 		schedule(std::string{});
 		m_log->info("unloaded, Qt stylesheet restored");
 	}
@@ -657,6 +686,113 @@ private:
 				m_log->warn("couldn't emit picked_image_done: {}", emitted.error());
 			}
 			m_log->info("image picker: '{}' {}", result_path, error);
+		};
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
+	}
+
+	// ===== per-widget stylesheets =====
+	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
+	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
+
+	// QWidget::styleSheet() isn't wrapped by RML, so look it up in Qt directly.
+	// MSVC x64: a member returning a class by value takes (this, return slot).
+	static std::string widget_style_sheet(rml::qt::QWidget* widget)
+	{
+#ifdef _WIN32
+		using Getter = void* (*)(const void* self, void* ret);
+		static const Getter getter = []() -> Getter {
+			HMODULE module = GetModuleHandleW(L"Qt5Widgets.dll");
+			if (!module)
+			{
+				return nullptr;
+			}
+			return reinterpret_cast<Getter>(GetProcAddress(module, "?styleSheet@QWidget@@QEBA?AVQString@@XZ"));
+		}();
+		if (!getter || !widget)
+		{
+			return {};
+		}
+		rml::qt::QString result;
+		getter(widget, result.storage());
+		return result.to_utf8();
+#else
+		(void)widget;
+		return {};
+#endif
+	}
+
+	static std::string strip_ours(const std::string& sheet)
+	{
+		const auto begin = sheet.find(kBegin);
+		if (begin == std::string::npos)
+		{
+			return sheet;
+		}
+		const auto end = sheet.find(kEnd, begin);
+		if (end == std::string::npos)
+		{
+			return sheet.substr(0, begin);
+		}
+		return sheet.substr(0, begin) + sheet.substr(end + kEnd.size());
+	}
+
+	static bool blank(const std::string& text)
+	{
+		return std::all_of(text.begin(), text.end(), [](char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; });
+	}
+
+	void schedule_restyle(std::string css)
+	{
+		auto task = [this, css = std::move(css)]() {
+			int changed = 0;
+			int owned = 0;
+			for (auto* widget : rml::qt::QApplication::all_widgets())
+			{
+				if (!widget)
+				{
+					continue;
+				}
+				const std::string own = widget_style_sheet(widget);
+				if (own.empty())
+				{
+					continue; // no own sheet: the app-wide stylesheet already reaches it
+				}
+				const std::string base = strip_ours(own);
+				if (blank(base))
+				{
+					// only our block was there (Studio cleared its sheet): drop it
+					if (own != base)
+					{
+						const rml::qt::QString empty("");
+						widget->setStyleSheet(empty);
+						++changed;
+					}
+					continue;
+				}
+				++owned;
+				std::string want = base;
+				if (!css.empty())
+				{
+					want += std::string(kBegin) + css + std::string(kEnd);
+				}
+				if (want != own)
+				{
+					const rml::qt::QString sheet(want);
+					widget->setStyleSheet(sheet);
+					++changed;
+				}
+			}
+			if (changed > 0)
+			{
+				m_log->info("restyled {} widget(s) that have their own stylesheet ({} total)", changed, owned);
+			}
 		};
 		if (auto* qt = rml::qt::QtIntegration::instance())
 		{

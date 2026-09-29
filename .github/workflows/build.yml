@@ -1,5 +1,6 @@
-# Builds the Studio Theme native helper (and optionally RML with the
-# drag-crash fix) on GitHub's Windows servers. Nothing to install locally.
+# Builds ONLY the Studio Theme native helper (studio_theme_qt.dll) on GitHub's
+# Windows servers. RML is compiled once (the helper has to link against it)
+# and then cached, so later runs only recompile main.cpp - a few minutes.
 name: Build Studio Theme helper
 
 on:
@@ -10,56 +11,49 @@ on:
         description: "Your RML version (first line of your RML log, e.g. 17589c0)"
         required: true
         default: "17589c0"
-      crash_fix:
-        description: "Also build roblox_modloader.dll with the drag/resize crash fix"
-        type: boolean
-        default: true
 
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      RML_REF: ${{ github.event.inputs.rml_ref || '17589c0' }}
     steps:
       - name: Get this kit
         uses: actions/checkout@v4
         with:
           path: kit
 
-      - name: Get RML source (same version you run)
+      # Restores RML's source + compiled objects from the last run. File
+      # timestamps are kept, so Ninja only rebuilds what changed (main.cpp).
+      # Bump "v1" to force a clean rebuild.
+      - name: Restore cached RML build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            rml
+            !rml/.git
+          key: rml-build-${{ env.RML_REF }}-v1
+
+      - name: Get RML source (first run only)
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $ref = "${{ github.event.inputs.rml_ref }}"
-          if (-not $ref) { $ref = "17589c0" }
           git clone https://github.com/revolutionxk/roblox-modloader.git rml
           cd rml
-          git checkout $ref
+          git checkout $env:RML_REF
           git submodule update --init --recursive
 
-      - name: Add the helper (+ crash fix)
+      - name: Add the helper
         shell: pwsh
         run: |
-          # Find the files wherever GitHub's uploader put them (top level,
-          # inside studio_theme_qt/, or inside studio_theme_helper_kit/...).
-          Write-Host "Files in your repo:"
-          Get-ChildItem kit -Recurse -File | Where-Object { $_.FullName -notmatch '\\.git\\' } | ForEach-Object { Write-Host "  $($_.FullName.Substring((Resolve-Path kit).Path.Length))" }
           $main = Get-ChildItem kit -Recurse -Filter main.cpp -File |
             Where-Object { Select-String -Path $_.FullName -Pattern 'studio_theme_qt' -Quiet } |
             Select-Object -First 1
-          if (-not $main) { throw "Couldn't find main.cpp in your repo. Upload the main.cpp file from the studio_theme_qt folder (Add file > Upload files), then run this again." }
+          if (-not $main) { throw "Couldn't find main.cpp in your repo. Upload the main.cpp file (Add file > Upload files), then run this again." }
           Write-Host "Using $($main.FullName)"
           New-Item -ItemType Directory -Force rml/examples/studio_theme_qt | Out-Null
-          Copy-Item $main.FullName rml/examples/studio_theme_qt/main.cpp
-
-          $fix = "${{ github.event.inputs.crash_fix }}"
-          $patch = Get-ChildItem kit -Recurse -Filter *.patch -File | Select-Object -First 1
-          if ($fix -ne "false" -and $patch) {
-            Push-Location rml
-            git apply --whitespace=nowarn $patch.FullName
-            if ($LASTEXITCODE -ne 0) { Write-Warning "crash fix didn't apply to this RML version - building without it"; git checkout -- . ; $global:LASTEXITCODE = 0 }
-            Pop-Location
-          } elseif ($fix -ne "false") {
-            Write-Warning "rml_crash_dumper_fix.patch not found in your repo - building without the crash fix"
-          }
-          exit 0
+          Copy-Item $main.FullName rml/examples/studio_theme_qt/main.cpp -Force
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -71,12 +65,14 @@ jobs:
         with:
           arch: x64
 
-      - name: Build
+      - name: Build helper
         shell: pwsh
         working-directory: rml
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
-          cmake --build build --parallel --target roblox_modloader studio_theme_qt
+          if (-not (Test-Path build/build.ninja)) {
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+          }
+          cmake --build build --parallel --target studio_theme_qt
 
       - name: Package
         shell: pwsh
@@ -85,14 +81,10 @@ jobs:
           $helper = Get-ChildItem rml/build -Recurse -Filter studio_theme_qt.dll | Select-Object -First 1
           if (-not $helper) { throw "studio_theme_qt.dll wasn't built" }
           Copy-Item $helper.FullName "out/RobloxModLoader/mods/studio_theme/native/"
-          if ("${{ github.event.inputs.crash_fix }}" -ne "false") {
-            $loader = Get-ChildItem rml/build -Recurse -Filter roblox_modloader.dll | Select-Object -First 1
-            if ($loader) { Copy-Item $loader.FullName "out/RobloxModLoader/" }
-          }
           Set-Content out/INSTALL.txt @"
           Close Studio, then copy the RobloxModLoader folder from this zip on top of
           your existing one:  ...\Roblox\Versions\version-xxxx\RobloxModLoader
-          (say Yes to replace). Back up roblox_modloader.dll first if you like.
+          (say Yes to replace). Only studio_theme_qt.dll is inside.
           "@
 
       - uses: actions/upload-artifact@v4

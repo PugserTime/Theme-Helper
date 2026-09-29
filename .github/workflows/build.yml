@@ -8,15 +8,15 @@ on:
   workflow_dispatch:
     inputs:
       rml_ref:
-        description: "Your RML version (first line of your RML log, e.g. 17589c0)"
+        description: "Your RML version (first line of your RML log, e.g. 9a4c803)"
         required: true
-        default: "17589c0"
+        default: "9a4c803"
 
 jobs:
   build:
     runs-on: windows-latest
     env:
-      RML_REF: ${{ github.event.inputs.rml_ref || '17589c0' }}
+      RML_REF: ${{ github.event.inputs.rml_ref || '9a4c803' }}
     steps:
       - name: Get this kit
         uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
           path: |
             rml
             !rml/.git
-          key: rml-build-${{ env.RML_REF }}-v1
+          key: rml-build-${{ env.RML_REF }}-v2
 
       - name: Get RML source (first run only)
         if: steps.cache.outputs.cache-hit != 'true'

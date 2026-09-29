@@ -1,18 +1,14 @@
 // Studio Theme Qt helper
 //
-// Native RML mod that lets Studio Theme Luau scripts restyle native Qt UI.
-// The helper captures Studio's original application stylesheet and appends
-// theme CSS supplied by Luau.
+// Tiny native RML mod that lets the Studio Theme Luau scripts restyle the
+// parts of Studio that are native Qt (dock panel tabs + title bars, menu
+// bar, menus, status bar, tooltips, native dialogs). Luau can't reach Qt,
+// so the scripts build a Qt stylesheet and hand it over the bridge:
 //
-// Properties-panel protection:
-// Roblox's Properties dock contains native editable controls. Broad app-level
-// QSS selectors (QCheckBox::indicator, QLineEdit, QComboBox, QAbstractButton,
-// etc.) can accidentally style them and break their appearance.
+//     bridge.call("studio_theme_qt", "apply", cssText)   -- "" = restore
 //
-// After applying the application stylesheet, this helper explicitly assigns
-// the original application CSS to the Properties dock and all of its children.
-// A widget-local stylesheet has precedence over QApplication's stylesheet,
-// so property editors stay visually native even if the theme has broad rules.
+// Studio's own stylesheet is captured once and always kept underneath ours,
+// and it's put back when the mod unloads.
 
 #include <RobloxModLoader/logger/logger.hpp>
 #include <RobloxModLoader/luau/luau_bridge.hpp>
@@ -33,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -80,7 +77,7 @@ public:
     studio_theme_qt()
     {
         name = "Studio Theme Qt";
-        version = "1.1.0";
+        version = "1.1.1";
         author = "gasolongames";
         description = "Qt stylesheet helper for the Studio Theme mod";
         m_log = rml::Logger::get_logger("StudioThemeQt");
@@ -124,53 +121,6 @@ public:
     {
         register_bridge();
     }
-
-    void on_unload() override
-    {
-        m_stop = true;
-
-        if (auto* qt = rml::qt::QtIntegration::instance(); qt && m_menu_root != 0)
-        {
-            qt->menu().remove(m_menu_root);
-            m_menu_root = 0;
-        }
-
-        if (auto* runtime = script_runtime(); runtime && m_registered)
-        {
-            auto& bridge = runtime->bridge();
-
-            for (const char* fn : {
-                "apply",
-                "scan",
-                "pick_image",
-                "install_image",
-                "compose_topbar",
-                "restyle_widgets",
-                "save_theme",
-                "load_theme",
-                "set_presets",
-                "ping"
-            })
-            {
-                auto removed = bridge.unregister_function("studio_theme_qt", fn);
-
-                if (!removed)
-                {
-                    m_log->debug("unregister {}: {}", fn, removed.error());
-                }
-            }
-        }
-
-        schedule_restyle(std::string{}, std::string{});
-        schedule(std::string{});
-
-        m_log->info("unloaded, Qt stylesheet restored");
-    }
-
-private:
-    // =========================================================================
-    // Bridge registration
-    // =========================================================================
 
     bool register_bridge()
     {
@@ -283,12 +233,12 @@ private:
             "studio_theme_qt",
             "compose_topbar",
             [this](const BridgeArgs& args) -> BridgeArgs {
-                auto text = [&](std::size_t index) -> std::string {
-                    if (index < args.size())
+                auto text = [&](std::size_t i) -> std::string {
+                    if (i < args.size())
                     {
-                        if (const auto* value = std::get_if<std::string>(&args[index]))
+                        if (const auto* v = std::get_if<std::string>(&args[i]))
                         {
-                            return *value;
+                            return *v;
                         }
                     }
 
@@ -299,9 +249,9 @@ private:
 
                 if (args.size() > 2)
                 {
-                    if (const auto* value = std::get_if<double>(&args[2]))
+                    if (const auto* d = std::get_if<double>(&args[2]))
                     {
-                        opacity = *value;
+                        opacity = *d;
                     }
                 }
 
@@ -488,6 +438,49 @@ private:
         return true;
     }
 
+    void on_unload() override
+    {
+        m_stop = true;
+
+        if (auto* qt = rml::qt::QtIntegration::instance(); qt && m_menu_root != 0)
+        {
+            qt->menu().remove(m_menu_root);
+            m_menu_root = 0;
+        }
+
+        if (auto* runtime = script_runtime(); runtime && m_registered)
+        {
+            auto& bridge = runtime->bridge();
+
+            for (const char* fn : {
+                "apply",
+                "scan",
+                "pick_image",
+                "install_image",
+                "compose_topbar",
+                "restyle_widgets",
+                "save_theme",
+                "load_theme",
+                "set_presets",
+                "ping"
+            })
+            {
+                auto removed = bridge.unregister_function("studio_theme_qt", fn);
+
+                if (!removed)
+                {
+                    m_log->debug("unregister {}: {}", fn, removed.error());
+                }
+            }
+        }
+
+        schedule_restyle(std::string{}, std::string{});
+        schedule(std::string{});
+
+        m_log->info("unloaded, Qt stylesheet restored");
+    }
+
+private:
     // =========================================================================
     // Mods > Studio Theme menu
     // =========================================================================
@@ -646,7 +639,7 @@ private:
     }
 
     // =========================================================================
-    // Qt widget scan
+    // Scan current Qt widget classes
     // =========================================================================
 
     void schedule_scan()
@@ -737,10 +730,6 @@ private:
         }
     }
 
-    // =========================================================================
-    // General helpers
-    // =========================================================================
-
     static std::string json_escape(const std::string& text)
     {
         std::string out;
@@ -790,7 +779,7 @@ private:
     }
 
     // =========================================================================
-    // Top-bar composition
+    // Top-bar image composition
     // =========================================================================
 
     void schedule_compose(
@@ -1103,7 +1092,7 @@ private:
     }
 
     // =========================================================================
-    // Image picker
+    // Native image picker
     // =========================================================================
 
     void schedule_pick(std::string images_dir)
@@ -1223,14 +1212,14 @@ private:
     }
 
     // =========================================================================
-    // Per-widget stylesheets
+    // Per-widget stylesheet helpers
     // =========================================================================
 
     static constexpr std::string_view kBegin =
         "\n/*studio_theme:begin*/\n";
 
     static constexpr std::string_view kEnd =
-        "\n/*studio_theme:end*/";
+        "\n/*studio_theme:end*/\n";
 
     static std::string widget_style_sheet(rml::qt::QWidget* widget)
     {
@@ -1376,8 +1365,7 @@ private:
                 {
                     if (base != own)
                     {
-                        const rml::qt::QString sheet(base);
-                        widget->setStyleSheet(sheet);
+                        widget->setStyleSheet(rml::qt::QString(base));
                         ++changed;
                     }
 
@@ -1388,8 +1376,7 @@ private:
                 {
                     if (own != base)
                     {
-                        const rml::qt::QString empty("");
-                        widget->setStyleSheet(empty);
+                        widget->setStyleSheet(rml::qt::QString(""));
                         ++changed;
                     }
 
@@ -1410,8 +1397,7 @@ private:
 
                 if (want != own)
                 {
-                    const rml::qt::QString sheet(want);
-                    widget->setStyleSheet(sheet);
+                    widget->setStyleSheet(rml::qt::QString(want));
                     ++changed;
                 }
             }
@@ -1438,18 +1424,8 @@ private:
     }
 
     // =========================================================================
-    // Properties protection
+    // Properties-panel native editor protection
     // =========================================================================
-    //
-    // This is the actual fix for the blank square.
-    //
-    // We locate widgets related to the Properties dock by their class name.
-    // Once one is found, it and every descendant receives the original Studio
-    // stylesheet as its own local sheet. Local widget sheets beat the app-level
-    // themed QSS, preventing generic indicator/button/editor rules from
-    // touching native property editors.
-    //
-    // On restore/unload we clear only widgets that carry our exact marker.
 
     static constexpr std::string_view kPropertiesBegin =
         "\n/*studio_theme:properties-protection:begin*/\n";
@@ -1474,21 +1450,21 @@ private:
 
         for (std::size_t i = 0; i <= text.size() - needle.size(); ++i)
         {
-            bool matches = true;
+            bool match = true;
 
             for (std::size_t j = 0; j < needle.size(); ++j)
             {
-                const auto a = static_cast<unsigned char>(text[i + j]);
-                const auto b = static_cast<unsigned char>(needle[j]);
+                const auto text_ch = static_cast<unsigned char>(text[i + j]);
+                const auto needle_ch = static_cast<unsigned char>(needle[j]);
 
-                if (std::tolower(a) != std::tolower(b))
+                if (std::tolower(text_ch) != std::tolower(needle_ch))
                 {
-                    matches = false;
+                    match = false;
                     break;
                 }
             }
 
-            if (matches)
+            if (match)
             {
                 return true;
             }
@@ -1551,57 +1527,6 @@ private:
         int protected_count = 0;
         int restored_count = 0;
 
-        std::set<rml::qt::QWidget*> protected_widgets;
-
-        bool has_properties_root = false;
-
-        for (auto* widget : rml::qt::QApplication::all_widgets())
-        {
-            if (!is_properties_widget(widget))
-            {
-                continue;
-            }
-
-            has_properties_root = true;
-            protected_widgets.insert(widget);
-        }
-
-        // If Studio's root class changed and the root itself has a less obvious
-        // name, protect all descendants of a known Properties-related widget.
-        //
-        // This second pass determines whether a candidate widget belongs below
-        // one of those roots by walking parent widgets.
-        for (auto* widget : rml::qt::QApplication::all_widgets())
-        {
-            if (!widget)
-            {
-                continue;
-            }
-
-            auto* current = widget;
-
-            while (current)
-            {
-                if (protected_widgets.count(current) > 0)
-                {
-                    protected_widgets.insert(widget);
-                    break;
-                }
-
-                current = current->parent_widget();
-            }
-        }
-
-        // If no Properties root has been found in this Studio build, do not
-        // blanket-style arbitrary widgets. The QSS-side fix below remains
-        // safe, and this logs the reason for easier widget-class investigation.
-        if (!has_properties_root)
-        {
-            m_log->debug(
-                "Properties protection: no Properties-related Qt root found"
-            );
-        }
-
         for (auto* widget : rml::qt::QApplication::all_widgets())
         {
             if (!widget)
@@ -1610,21 +1535,14 @@ private:
             }
 
             const std::string own = widget_style_sheet(widget);
-            const bool should_protect =
-                protected_widgets.count(widget) > 0;
+            const bool should_protect = is_properties_widget(widget);
 
-            if (should_protect)
+            if (should_protect && !original_css.empty())
             {
-                // Preserve a Studio-owned local style sheet if it exists.
-                // Add our protected fallback after it so the original global
-                // Studio CSS wins against the theme's app-level stylesheet.
-                //
-                // This blocks broad themed selectors but retains the widget's
-                // own native presentation where Studio already has one.
-                const std::string without_old =
+                const std::string base =
                     strip_properties_protection(own);
 
-                std::string wanted = without_old;
+                std::string wanted = base;
 
                 wanted += std::string(kPropertiesBegin);
                 wanted += original_css;
@@ -1632,29 +1550,23 @@ private:
 
                 if (wanted != own)
                 {
-                    widget->setStyleSheet(
-                        rml::qt::QString(wanted)
-                    );
-
+                    widget->setStyleSheet(rml::qt::QString(wanted));
                     ++protected_count;
                 }
 
                 continue;
             }
 
-            // A Properties panel may have been closed/recreated, or Studio
-            // may have changed its class on refresh. Remove only our marker
-            // from widgets that are no longer recognized as Properties UI.
             if (has_properties_marker(own))
             {
                 const std::string restored =
                     strip_properties_protection(own);
 
-                widget->setStyleSheet(
-                    rml::qt::QString(restored)
-                );
-
-                ++restored_count;
+                if (restored != own)
+                {
+                    widget->setStyleSheet(rml::qt::QString(restored));
+                    ++restored_count;
+                }
             }
         }
 
@@ -1669,7 +1581,7 @@ private:
     }
 
     // =========================================================================
-    // Application stylesheet application
+    // Apply global stylesheet
     // =========================================================================
 
     void schedule(std::string css)
@@ -1704,11 +1616,6 @@ private:
         {
             m_original = app->style_sheet();
             m_captured = true;
-
-            m_log->info(
-                "captured original Studio stylesheet ({} bytes)",
-                m_original.size()
-            );
         }
 
         const std::string full =
@@ -1727,17 +1634,14 @@ private:
             );
         }
 
-        // Apply/remove Properties protection after the app stylesheet.
-        // Calling this on every refresh also protects controls that Studio
-        // creates after the first theme application.
-        if (css.empty())
-        {
-            protect_properties_widgets(std::string{});
-        }
-        else
-        {
-            protect_properties_widgets(m_original);
-        }
+        // Important: run after app->set_style_sheet().
+        //
+        // Widget-local stylesheets beat QApplication stylesheets. We give
+        // matching Properties widgets Studio's original stylesheet, preventing
+        // generic QSS selectors from breaking boolean/numeric/text editors.
+        protect_properties_widgets(
+            css.empty() ? std::string{} : m_original
+        );
     }
 };
 

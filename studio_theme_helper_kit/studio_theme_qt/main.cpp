@@ -65,6 +65,10 @@ class studio_theme_qt final : public ModBase
 	std::string m_last_presets;
 	int m_compose_counter = 0;
 	std::string m_last_compose;
+	// restyle_widgets skips its full widget walk when nothing changed
+	std::string m_last_restyle_css;
+	std::size_t m_last_restyle_count = 0;
+	std::chrono::steady_clock::time_point m_last_restyle_time{};
 
 public:
 	studio_theme_qt()
@@ -805,6 +809,28 @@ private:
 	void schedule_restyle(std::string css)
 	{
 		auto task = [this, css = std::move(css)]() {
+			// Cheap early-out: reading every widget's stylesheet is the expensive
+			// part, so skip the walk when the css and the number of live widgets
+			// are unchanged. A menu opening adds widgets (count changes), and the
+			// 30 s cap catches Studio resetting a sheet without the count moving.
+			std::size_t count = 0;
+			for (auto* w : rml::qt::QApplication::all_widgets())
+			{
+				if (w)
+				{
+					++count;
+				}
+			}
+			const auto now = std::chrono::steady_clock::now();
+			if (css == m_last_restyle_css && count == m_last_restyle_count &&
+			    now - m_last_restyle_time < std::chrono::seconds(30))
+			{
+				return;
+			}
+			m_last_restyle_css = css;
+			m_last_restyle_count = count;
+			m_last_restyle_time = now;
+
 			int changed = 0;
 			int owned = 0;
 			for (auto* widget : rml::qt::QApplication::all_widgets())

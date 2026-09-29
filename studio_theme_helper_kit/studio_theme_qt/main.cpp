@@ -31,10 +31,7 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
-#include <fstream>
-#include <iterator>
 #include <map>
-#include <set>
 #include <memory>
 #include <variant>
 #include <mutex>
@@ -223,11 +220,8 @@ public:
 		// colors or updated. This appends `css` to each such widget's own sheet
 		// (appended rules win). Safe to call repeatedly: our block is replaced,
 		// and new widgets (menus opened later) get picked up.
-		// Only classes in the allow-list (2nd arg, one class per line) are
-		// touched -- never Properties' editors, which also carry own sheets.
 		auto restyled = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
 			std::string css;
-			std::string allow;
 			if (!args.empty())
 			{
 				if (const auto* text = std::get_if<std::string>(&args[0]))
@@ -235,71 +229,12 @@ public:
 					css = *text;
 				}
 			}
-			if (args.size() > 1)
-			{
-				if (const auto* text = std::get_if<std::string>(&args[1]))
-				{
-					allow = *text;
-				}
-			}
-			schedule_restyle(std::move(css), std::move(allow));
+			schedule_restyle(std::move(css));
 			return {true};
 		});
 		if (!restyled)
 		{
 			m_log->error("couldn't register restyle_widgets: {}", restyled.error());
-		}
-
-		// save_theme(path, text) / load_theme(path): the theme as a file in the
-		// mod folder, so the Studio half can apply it the moment Studio starts.
-		auto saved = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
-			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
-			const auto* text = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
-			if (!path || !text || path->empty())
-			{
-				return {std::string{"missing arguments"}};
-			}
-			namespace fs = std::filesystem;
-			const fs::path file = from_utf8(*path);
-			const fs::path temp = fs::path(file).concat(".tmp");
-			{
-				std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-				if (!out)
-				{
-					return {std::string{"couldn't write "} + *path};
-				}
-				out << *text;
-			}
-			std::error_code ec;
-			fs::rename(temp, file, ec); // atomic replace: never a half-written theme
-			if (ec)
-			{
-				return {"couldn't save theme: " + ec.message()};
-			}
-			return {true};
-		});
-		if (!saved)
-		{
-			m_log->error("couldn't register save_theme: {}", saved.error());
-		}
-
-		auto loaded = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
-			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
-			if (!path || path->empty())
-			{
-				return {std::string{}};
-			}
-			std::ifstream in(from_utf8(*path), std::ios::binary);
-			if (!in)
-			{
-				return {std::string{}};
-			}
-			std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-			return {text};
-		});
-		if (!loaded)
-		{
-			m_log->error("couldn't register load_theme: {}", loaded.error());
 		}
 
 		auto presets = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
@@ -342,7 +277,7 @@ public:
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "save_theme", "load_theme", "set_presets", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "set_presets", "ping"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)
@@ -351,7 +286,7 @@ public:
 				}
 			}
 		}
-		schedule_restyle(std::string{}, std::string{});
+		schedule_restyle(std::string{});
 		schedule(std::string{});
 		m_log->info("unloaded, Qt stylesheet restored");
 	}
@@ -813,31 +748,9 @@ private:
 		return std::all_of(text.begin(), text.end(), [](char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; });
 	}
 
-	// Default allow-list: the widgets whose own Studio sheet blocked the theme.
-	static constexpr std::string_view kDefaultAllow =
-	    "OutputWidgetRibbon\nOutputFilterTextEdit\nOutputFindSearchBar\nOutputRibbonCombinedFilterDropdown\n"
-	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
-	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu";
-
-	void schedule_restyle(std::string css, std::string allow_text)
+	void schedule_restyle(std::string css)
 	{
-		auto task = [this, css = std::move(css), allow_text = std::move(allow_text)]() {
-			std::set<std::string> allow;
-			{
-				std::istringstream lines(allow_text.empty() ? std::string(kDefaultAllow) : allow_text);
-				std::string line;
-				while (std::getline(lines, line))
-				{
-					if (!line.empty() && line.back() == '\r')
-					{
-						line.pop_back();
-					}
-					if (!line.empty())
-					{
-						allow.insert(line);
-					}
-				}
-			}
+		auto task = [this, css = std::move(css)]() {
 			int changed = 0;
 			int owned = 0;
 			for (auto* widget : rml::qt::QApplication::all_widgets())
@@ -851,21 +764,7 @@ private:
 				{
 					continue; // no own sheet: the app-wide stylesheet already reaches it
 				}
-				const char* cls = widget->class_name();
-				const bool allowed = !css.empty() && cls && allow.count(cls) > 0;
 				const std::string base = strip_ours(own);
-				if (!allowed)
-				{
-					// not ours to touch -- also removes blocks an older version
-					// appended here (e.g. inside Properties)
-					if (base != own)
-					{
-						const rml::qt::QString sheet(base);
-						widget->setStyleSheet(sheet);
-						++changed;
-					}
-					continue;
-				}
 				if (blank(base))
 				{
 					// only our block was there (Studio cleared its sheet): drop it

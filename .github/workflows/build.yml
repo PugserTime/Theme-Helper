@@ -5,6 +5,12 @@
 # (RML ABI N)". Direct link, always the newest build for that ABI:
 #   https://github.com/<you>/<repo>/releases/download/helper-abi<N>/studio_theme_qt.dll
 #
+# Auto-update: GitHub can't notify this repo when RML changes (it isn't your
+# repo), so a tiny Linux job "watches" RML once an hour. It reads RML's latest
+# ABI number (a few seconds, no build). Only when there is NO release for that
+# ABI yet does it start the real Windows build - so a new ABI gets its DLL
+# within about an hour, automatically, and every other hour costs nothing.
+#
 # Why it's fast:
 #  * RML is compiled once and cached. The cache is keyed by the RML ABI and by
 #    this runner's compiler version (a cached build points at absolute compiler
@@ -12,8 +18,8 @@
 #    main.cpp - a few minutes.
 #  * The cache is saved even when the helper fails to compile, so fixing a typo
 #    in main.cpp never means recompiling RML again.
-#  * It only runs when main.cpp or a workflow file changes (README edits etc.
-#    don't trigger it). You can still start it by hand from the Actions tab.
+#  * Pushes only build when main.cpp or a workflow file changes (README edits
+#    etc. don't trigger it). You can still start it by hand from the Actions tab.
 #  * .NET is only installed when RML actually has to be compiled.
 
 name: Build Studio Theme helper
@@ -26,13 +32,17 @@ on:
       - "**/main.cpp"
       - ".github/workflows/*.yml"
 
+  # The RML watcher. Runs the cheap check only; see the "detect" job.
+  schedule:
+    - cron: "23 * * * *"
+
   workflow_dispatch:
     inputs:
       rml_ref:
-        description: "RML commit, tag, or branch (leave as default unless you need a specific version)"
-        required: true
+        description: "RML commit, tag, or branch. Leave empty for the latest RML."
+        required: false
         type: string
-        default: "9a4c803"
+        default: ""
 
 # One build at a time, and never cancel one halfway: a cancelled first build
 # would throw away the long RML compile before it could be cached.
@@ -42,18 +52,74 @@ concurrency:
 
 permissions:
   contents: write # needed to publish the release
+  actions: write  # lets the watcher keep its own schedule from being auto-disabled
+
+env:
+  RML_REPO: revolutionxk/roblox-modloader
+  ABI_HEADER: code/roblox_modloader/include/RobloxModLoader/version.hpp
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Cheap watcher (seconds, Linux). Decides whether a Windows build is needed.
+  #  * push / manual run  -> always build (manual runs can pick an RML version)
+  #  * hourly schedule    -> build only if no release exists for RML's latest ABI
+  # ---------------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.rml.outputs.sha }}
+      abi: ${{ steps.rml.outputs.abi }}
+      build: ${{ steps.decide.outputs.build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      REQUESTED_REF: ${{ inputs.rml_ref }}
+    steps:
+      # GitHub switches scheduled workflows off after 60 days without repo
+      # activity. Re-enabling ourselves on every check keeps the watcher alive.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        run: gh workflow enable "${{ github.workflow }}" || true
+
+      - name: Read RML's latest commit and ABI
+        id: rml
+        run: |
+          REF="$REQUESTED_REF"
+          [ -z "$REF" ] && REF="HEAD"
+          SHA=$(gh api "repos/$RML_REPO/commits/$REF" --jq .sha)
+          [ -n "$SHA" ] || { echo "Couldn't resolve RML ref '$REF'."; exit 1; }
+          ABI=$(gh api "repos/$RML_REPO/contents/$ABI_HEADER?ref=$SHA" --jq .content \
+            | base64 -d | grep -oE 'RML_ABI_VERSION[[:space:]]+[0-9]+' | grep -oE '[0-9]+$')
+          [ -n "$ABI" ] || { echo "Couldn't read RML_ABI_VERSION at $SHA (did RML move version.hpp?)."; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "abi=$ABI" >> "$GITHUB_OUTPUT"
+          echo "RML $SHA reports ABI $ABI"
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          BUILD=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if gh release view "helper-abi${{ steps.rml.outputs.abi }}" >/dev/null 2>&1; then
+              BUILD=false
+              echo "Release helper-abi${{ steps.rml.outputs.abi }} already exists - nothing to do."
+            else
+              echo "RML ABI ${{ steps.rml.outputs.abi }} has no release yet - building."
+            fi
+          fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
 
     env:
-      # `inputs.rml_ref` is set for manual runs. On a push it is empty, so this
-      # falls back to the commit you were already using.
-      RML_REF: ${{ inputs.rml_ref || '9a4c803' }}
-      RML_REPO: revolutionxk/roblox-modloader
-      ABI_HEADER: code/roblox_modloader/include/RobloxModLoader/version.hpp
+      # The watcher already resolved this to an exact RML commit (the latest
+      # one, or the one you typed for a manual run).
+      RML_REF: ${{ needs.detect.outputs.sha }}
       # Bump to force a clean rebuild of RML.
       CACHE_VERSION: v4
       # for the gh CLI (release + api calls); GH_REPO because the checkout is

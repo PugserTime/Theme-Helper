@@ -48,6 +48,30 @@
 
 using namespace rml::luau;
 
+#ifdef _WIN32
+// Our own on-disk DLL path, found via the address of this very function
+// rather than DllMain (portable to however RML loads mods, no extra hook
+// needed). Used so a staged update can be swapped in next launch.
+static std::filesystem::path self_module_path()
+{
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&self_module_path),
+			&module))
+	{
+		return {};
+	}
+	wchar_t buffer[MAX_PATH]{};
+	const DWORD length = GetModuleFileNameW(module, buffer, MAX_PATH);
+	if (length == 0 || length == MAX_PATH)
+	{
+		return {};
+	}
+	return std::filesystem::path(buffer, buffer + length);
+}
+#endif
+
 class studio_theme_qt final : public ModBase
 {
 	std::shared_ptr<spdlog::logger> m_log;
@@ -86,8 +110,41 @@ public:
 		m_log = rml::Logger::get_logger("StudioThemeQt");
 	}
 
+	// A DLL that's already loaded into this Studio process can't be
+	// overwritten in place — the update has to be staged as "<name>.dll.new"
+	// by stage_update() below, then swapped in here, at the very start of
+	// the NEXT on_load(), before this file has been mapped for the new
+	// session. So this only ever affects the launch after the one that
+	// downloaded it, never the currently-running instance.
+	void install_pending_update()
+	{
+#ifdef _WIN32
+		const auto self = self_module_path();
+		if (self.empty())
+		{
+			return;
+		}
+		auto staged = self;
+		staged += L".new";
+		std::error_code exists_ec;
+		if (!std::filesystem::exists(staged, exists_ec) || exists_ec)
+		{
+			return;
+		}
+		std::error_code rename_ec;
+		std::filesystem::rename(staged, self, rename_ec);
+		if (rename_ec)
+		{
+			m_log->warn("found a staged update but couldn't install it: {}", rename_ec.message());
+			return;
+		}
+		m_log->info("installed a staged update — this is the new version now");
+#endif
+	}
+
 	void on_load() override
 	{
+		install_pending_update();
 		m_log->info("loaded");
 		build_menu();
 		if (register_bridge())
@@ -318,6 +375,52 @@ public:
 			m_log->error("couldn't register ping: {}", pinged.error());
 		}
 
+		auto versioned = bridge.register_function("studio_theme_qt", "version", [this](const BridgeArgs&) -> BridgeArgs {
+			return {version};
+		});
+		if (!versioned)
+		{
+			m_log->error("couldn't register version: {}", versioned.error());
+		}
+
+		// Writes raw bytes to "<this dll>.new" next to the real one — not
+		// in place, since Windows won't let a loaded DLL be overwritten
+		// while it's running. install_pending_update() swaps it in at the
+		// start of the next on_load(), so this always needs a restart to
+		// actually take effect; nothing here claims otherwise.
+		auto staged_update = bridge.register_function("studio_theme_qt", "stage_update", [this](const BridgeArgs& args) -> BridgeArgs {
+#ifdef _WIN32
+			const auto* bytes = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
+			if (!bytes || bytes->empty())
+			{
+				return {false, std::string{"no data"}};
+			}
+			const auto self = self_module_path();
+			if (self.empty())
+			{
+				return {false, std::string{"couldn't find my own path"}};
+			}
+			auto staged = self;
+			staged += L".new";
+			{
+				std::ofstream out(staged, std::ios::binary | std::ios::trunc);
+				if (!out)
+				{
+					return {false, std::string{"couldn't write the staged file"}};
+				}
+				out.write(bytes->data(), static_cast<std::streamsize>(bytes->size()));
+			}
+			m_log->info("staged an update ({} bytes) — restart Studio to install it", bytes->size());
+			return {true};
+#else
+			return {false, std::string{"only implemented on Windows"}};
+#endif
+		});
+		if (!staged_update)
+		{
+			m_log->error("couldn't register stage_update: {}", staged_update.error());
+		}
+
 		m_registered = true;
 		m_log->info("bridge functions registered - the Studio Theme scripts can use this helper now");
 		return true;
@@ -339,7 +442,7 @@ public:
 		if (auto* runtime = script_runtime(); runtime && m_registered)
 		{
 			auto& bridge = runtime->bridge();
-			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "save_theme", "load_theme", "set_presets", "ping"})
+			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "restyle_widgets", "save_theme", "load_theme", "set_presets", "ping", "version", "stage_update"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
 				if (!removed)

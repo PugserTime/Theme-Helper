@@ -224,9 +224,14 @@ jobs:
 
           $exampleDir = "rml/examples/studio_theme_qt"
           $examplesRoot = "rml/examples/CMakeLists.txt"
+          $helperCmake = "kit/studio_theme_helper_kit/CMakeLists.txt"
 
           if (-not (Test-Path $examplesRoot)) {
             throw "RML examples CMake file was not found: $examplesRoot"
+          }
+
+          if (-not (Test-Path $helperCmake)) {
+            throw "Helper CMake file was not found: $helperCmake"
           }
 
           New-Item `
@@ -240,52 +245,10 @@ jobs:
             -Destination "$exampleDir/main.cpp" `
             -Force
 
-          # Find an existing RML native C++ mod example. Its CMake file has
-          # the correct RML target linkage and compile definitions for this
-          # particular RML revision.
-          $referenceCmake = Get-ChildItem `
-            -Path "rml/examples" `
-            -Recurse `
-            -Filter "CMakeLists.txt" `
-            -File |
-            Where-Object {
-              $_.FullName -notlike "*studio_theme_qt*" -and
-              (
-                Select-String `
-                  -Path $_.FullName `
-                  -Pattern "RML_EXPORT_MOD_ABI_VERSION|ModBase|mod_base" `
-                  -Quiet
-              )
-            } |
-            Select-Object -First 1
-
-          if (-not $referenceCmake) {
-            throw "Couldn't find an existing RML native-mod example CMakeLists.txt."
-          }
-
-          Write-Host "Native-mod CMake template: $($referenceCmake.FullName)"
-
-          $cmake = Get-Content `
-            -Path $referenceCmake.FullName `
-            -Raw
-
-          # Adapt common current and historical RML example target names.
-          $cmake = $cmake -replace "\bbasic_mod\b", "studio_theme_qt"
-          $cmake = $cmake -replace "\bbasic-mod\b", "studio_theme_qt"
-          $cmake = $cmake -replace "\bexample_mod\b", "studio_theme_qt"
-          $cmake = $cmake -replace "\bexample-mod\b", "studio_theme_qt"
-
-          # Most examples use main.cpp. If the template refers to a different
-          # source filename, add this helper source explicitly.
-          if ($cmake -notmatch "(?i)\bmain\.cpp\b") {
-            $cmake += "`n"
-            $cmake += "target_sources(studio_theme_qt PRIVATE main.cpp)`n"
-          }
-
-          Set-Content `
-            -Path "$exampleDir/CMakeLists.txt" `
-            -Value $cmake `
-            -Encoding utf8
+          Copy-Item `
+            -Path $helperCmake `
+            -Destination "$exampleDir/CMakeLists.txt" `
+            -Force
 
           $examplesCmake = Get-Content `
             -Path $examplesRoot `

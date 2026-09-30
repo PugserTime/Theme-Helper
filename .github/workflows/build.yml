@@ -197,14 +197,83 @@ jobs:
       - name: Publish Release abi-${{ needs.detect.outputs.abi }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $tag = "abi-$env:RML_ABI"
           $zip = "studio-theme-helper-abi$env:RML_ABI.zip"
+          $repo = $env:RML_REPO
+
           $notes = "Studio Theme native helper for RML_ABI_VERSION $env:RML_ABI (built against RML $env:RML_SHA). Download the zip, close Studio, and copy the RobloxModLoader folder over yours."
-          gh release view $tag 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $zip studio_theme_qt.dll --clobber
-            gh release edit $tag --notes "$notes"
-          } else {
-            gh release create $tag $zip studio_theme_qt.dll --title "Helper for RML ABI $env:RML_ABI" --notes "$notes"
+
+          if ([string]::IsNullOrWhiteSpace($repo)) {
+              throw "RML_REPO is not set"
           }
-          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed" }
+
+          if (-not (Test-Path $zip)) {
+              throw "Release zip not found: $zip"
+          }
+
+          if (-not (Test-Path "studio_theme_qt.dll")) {
+              throw "DLL not found: studio_theme_qt.dll"
+          }
+
+          Write-Host "Publishing Studio Theme helper..."
+          Write-Host "Repository: $repo"
+          Write-Host "Release:    $tag"
+          Write-Host "ZIP:        $zip"
+          Write-Host "DLL:        studio_theme_qt.dll"
+
+          # Check whether the release already exists.
+          # --repo is required because the checkout lives in ./kit,
+          # not in the current working directory.
+          gh release view $tag --repo $repo 2>$null | Out-Null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+
+          if ($releaseExists) {
+              Write-Host "Release $tag already exists. Uploading assets..."
+
+              gh release upload `
+                  $tag `
+                  $zip `
+                  studio_theme_qt.dll `
+                  --repo $repo `
+                  --clobber
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Uploading release assets failed"
+              }
+
+              Write-Host "Assets uploaded successfully."
+
+              gh release edit `
+                  $tag `
+                  --repo $repo `
+                  --notes "$notes"
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Updating release notes failed"
+              }
+
+              Write-Host "Release notes updated successfully."
+          }
+          else {
+              Write-Host "Release $tag does not exist. Creating it..."
+
+              gh release create `
+                  $tag `
+                  $zip `
+                  studio_theme_qt.dll `
+                  --repo $repo `
+                  --title "Helper for RML ABI $env:RML_ABI" `
+                  --notes "$notes"
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Creating release failed"
+              }
+
+              Write-Host "Release created successfully."
+          }
+
+          Write-Host ""
+          Write-Host "Release publishing completed successfully."
+          Write-Host "https://github.com/$repo/releases/tag/$tag"

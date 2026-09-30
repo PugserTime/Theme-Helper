@@ -13,6 +13,7 @@
 # You can also run it by hand (Actions > Build Studio Theme helper > Run
 # workflow) to build against a specific RML commit, e.g. an older ABI, or to
 # force a rebuild. Pushing a change to main.cpp rebuilds too.
+
 name: Build Studio Theme helper
 
 on:
@@ -21,17 +22,21 @@ on:
       - "studio_theme_helper_kit/**"
       - "**/main.cpp"
       - ".github/workflows/build.yml"
+
   schedule:
     - cron: "17 */6 * * *"
+
   workflow_dispatch:
     inputs:
       rml_ref:
         description: "RML commit / branch to build against. Leave empty for the latest."
         required: false
         default: ""
+
       force:
         description: "Rebuild even if a Release for this ABI already exists"
         type: boolean
+        required: false
         default: false
 
 permissions:
@@ -42,6 +47,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # RML source repository. This is NOT the release repository.
   RML_REPO: revolutionxk/roblox-modloader
   ABI_HEADER: code/roblox_modloader/include/RobloxModLoader/version.hpp
 
@@ -49,41 +55,81 @@ jobs:
   detect:
     name: Check RML's ABI
     runs-on: ubuntu-latest
+
     outputs:
       sha: ${{ steps.rml.outputs.sha }}
       abi: ${{ steps.rml.outputs.abi }}
       build: ${{ steps.decide.outputs.build }}
+
     env:
       GH_TOKEN: ${{ github.token }}
+
     steps:
       - name: Resolve RML commit and read its ABI number
         id: rml
+        shell: bash
         run: |
+          set -e
+
           REF="${{ github.event.inputs.rml_ref }}"
-          [ -z "$REF" ] && REF="HEAD"
+
+          if [ -z "$REF" ]; then
+            REF="HEAD"
+          fi
+
           SHA=$(gh api "repos/$RML_REPO/commits/$REF" --jq .sha)
-          [ -n "$SHA" ] || { echo "Couldn't resolve RML ref '$REF'"; exit 1; }
-          ABI=$(gh api "repos/$RML_REPO/contents/$ABI_HEADER?ref=$SHA" --jq .content | base64 -d | grep -oE 'RML_ABI_VERSION[[:space:]]+[0-9]+' | grep -oE '[0-9]+$')
-          [ -n "$ABI" ] || { echo "Couldn't read RML_ABI_VERSION at $SHA (did RML move version.hpp?)"; exit 1; }
+
+          if [ -z "$SHA" ]; then
+            echo "Couldn't resolve RML ref '$REF'"
+            exit 1
+          fi
+
+          ABI=$(gh api \
+            "repos/$RML_REPO/contents/$ABI_HEADER?ref=$SHA" \
+            --jq .content |
+            base64 -d |
+            grep -oE 'RML_ABI_VERSION[[:space:]]+[0-9]+' |
+            grep -oE '[0-9]+$')
+
+          if [ -z "$ABI" ]; then
+            echo "Couldn't read RML_ABI_VERSION at $SHA"
+            exit 1
+          fi
+
+          echo "RML $SHA -> ABI $ABI"
+
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "abi=$ABI" >> "$GITHUB_OUTPUT"
-          echo "RML $SHA -> ABI $ABI"
 
       - name: Decide whether to build
         id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           BUILD=true
-          # Scheduled runs only build when this ABI has no Release yet.
+
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            if gh release view "abi-${{ steps.rml.outputs.abi }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if gh release view \
+              "abi-${{ steps.rml.outputs.abi }}" \
+              --repo "${{ github.repository }}" \
+              >/dev/null 2>&1; then
+
               BUILD=false
               echo "Release abi-${{ steps.rml.outputs.abi }} already exists - nothing to do."
+
             else
               echo "New ABI ${{ steps.rml.outputs.abi }} detected - building."
             fi
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
-            : # manual runs always build; "force" only matters for documentation
+
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.force }}" = "true" ]; then
+              echo "Manual forced rebuild requested."
+            else
+              echo "Manual build requested."
+            fi
           fi
+
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
 
   build:
@@ -91,10 +137,11 @@ jobs:
     needs: detect
     if: needs.detect.outputs.build == 'true'
     runs-on: windows-latest
+
     env:
       RML_SHA: ${{ needs.detect.outputs.sha }}
       RML_ABI: ${{ needs.detect.outputs.abi }}
-      GH_TOKEN: ${{ github.token }}
+
     steps:
       - name: Get this kit
         uses: actions/checkout@v4
@@ -103,6 +150,8 @@ jobs:
 
       # RML's source + compiled objects are cached per RML commit, so re-running
       # for the same commit (e.g. after editing main.cpp) only recompiles main.cpp.
+      #
+      # Bump "v3" to force a clean rebuild.
       - name: Restore cached RML build
         id: cache
         uses: actions/cache@v4
@@ -116,7 +165,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          git clone https://github.com/${{ env.RML_REPO }}.git rml
+          git clone https://github.com/revolutionxk/roblox-modloader.git rml
           cd rml
           git checkout $env:RML_SHA
           git submodule update --init --recursive
@@ -125,12 +174,27 @@ jobs:
         shell: pwsh
         run: |
           $main = Get-ChildItem kit -Recurse -Filter main.cpp -File |
-            Where-Object { Select-String -Path $_.FullName -Pattern 'studio_theme_qt' -Quiet } |
+            Where-Object {
+              Select-String -Path $_.FullName -Pattern 'studio_theme_qt' -Quiet
+            } |
             Select-Object -First 1
-          if (-not $main) { throw "Couldn't find main.cpp in your repo. Upload the main.cpp file (Add file > Upload files), then run this again." }
+
+          if (-not $main) {
+            throw "Couldn't find main.cpp in your repo. Upload the main.cpp file (Add file > Upload files), then run this again."
+          }
+
           Write-Host "Using $($main.FullName)"
-          New-Item -ItemType Directory -Force rml/examples/studio_theme_qt | Out-Null
-          Copy-Item $main.FullName rml/examples/studio_theme_qt/main.cpp -Force
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            rml/examples/studio_theme_qt |
+            Out-Null
+
+          Copy-Item `
+            $main.FullName `
+            rml/examples/studio_theme_qt/main.cpp `
+            -Force
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -147,35 +211,91 @@ jobs:
         working-directory: rml
         run: |
           if (-not (Test-Path build/build.ninja)) {
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+            cmake `
+              -B build `
+              -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_C_COMPILER=cl `
+              -DCMAKE_CXX_COMPILER=cl
           }
-          cmake --build build --parallel --target studio_theme_qt
+
+          cmake `
+            --build build `
+            --parallel `
+            --target studio_theme_qt
 
       # Safety net: the DLL must report exactly the ABI number we detected,
-      # otherwise RML would reject it. (rml_abi_version compiles to
-      # "mov eax, N ; ret" = B8 <N as 4 bytes> C3.)
+      # otherwise RML would reject it.
+      #
+      # rml_abi_version compiles to:
+      #     mov eax, N
+      #     ret
+      #
+      # which is B8 <N as 4 bytes> C3.
       - name: Verify the DLL reports ABI ${{ needs.detect.outputs.abi }}
         shell: pwsh
         run: |
-          $dll = Get-ChildItem rml/build -Recurse -Filter studio_theme_qt.dll | Select-Object -First 1
-          if (-not $dll) { throw "studio_theme_qt.dll wasn't built" }
+          $dll = Get-ChildItem `
+            rml/build `
+            -Recurse `
+            -Filter studio_theme_qt.dll |
+            Select-Object -First 1
+
+          if (-not $dll) {
+            throw "studio_theme_qt.dll wasn't built"
+          }
+
+          Write-Host "Found DLL: $($dll.FullName)"
+
           $code = @'
-          import struct, sys
+          import struct
+          import sys
+
           data = open(sys.argv[1], "rb").read()
           abi = int(sys.argv[2])
-          sys.exit(0 if b"\xb8" + struct.pack("<I", abi) + b"\xc3" in data else 1)
+
+          signature = b"\xb8" + struct.pack("<I", abi) + b"\xc3"
+
+          sys.exit(0 if signature in data else 1)
           '@
+
           $code | python - $dll.FullName $env:RML_ABI
-          if ($LASTEXITCODE -ne 0) { throw "Built DLL does not report ABI $env:RML_ABI - not publishing it." }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Built DLL does not report ABI $env:RML_ABI - not publishing it."
+          }
+
           Write-Host "OK: DLL reports ABI $env:RML_ABI"
 
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force "out/RobloxModLoader/mods/studio_theme/native" | Out-Null
-          $helper = Get-ChildItem rml/build -Recurse -Filter studio_theme_qt.dll | Select-Object -First 1
-          Copy-Item $helper.FullName "out/RobloxModLoader/mods/studio_theme/native/"
-          Copy-Item $helper.FullName "studio_theme_qt.dll"
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            "out/RobloxModLoader/mods/studio_theme/native" |
+            Out-Null
+
+          $helper = Get-ChildItem `
+            rml/build `
+            -Recurse `
+            -Filter studio_theme_qt.dll |
+            Select-Object -First 1
+
+          if (-not $helper) {
+            throw "studio_theme_qt.dll wasn't built"
+          }
+
+          Copy-Item `
+            $helper.FullName `
+            "out/RobloxModLoader/mods/studio_theme/native/"
+
+          # Keep a standalone DLL so it can also be attached directly
+          # to the GitHub Release.
+          Copy-Item `
+            $helper.FullName `
+            "studio_theme_qt.dll"
+
           Set-Content out/INSTALL.txt @"
           Studio Theme native helper - built for RML_ABI_VERSION $env:RML_ABI
           (RML commit $env:RML_SHA)
@@ -187,91 +307,115 @@ jobs:
           If Studio's mod log says the helper "was built against RML_ABI_VERSION=X but
           the loader is RML_ABI_VERSION=Y", download the Release named abi-Y instead.
           "@
-          Compress-Archive -Path out/RobloxModLoader, out/INSTALL.txt -DestinationPath "studio-theme-helper-abi$env:RML_ABI.zip" -Force
+
+          Compress-Archive `
+            -Path out/RobloxModLoader, out/INSTALL.txt `
+            -DestinationPath "studio-theme-helper-abi$env:RML_ABI.zip" `
+            -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: studio-theme-helper-abi${{ env.RML_ABI }}
           path: out
 
+      # The RML repository above is only the source repository.
+      # The Release must be created in the repository running this workflow.
       - name: Publish Release abi-${{ needs.detect.outputs.abi }}
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $tag = "abi-$env:RML_ABI"
           $zip = "studio-theme-helper-abi$env:RML_ABI.zip"
-          $repo = $env:RML_REPO
+          $repo = $env:RELEASE_REPO
 
-          $notes = "Studio Theme native helper for RML_ABI_VERSION $env:RML_ABI (built against RML $env:RML_SHA). Download the zip, close Studio, and copy the RobloxModLoader folder over yours."
-
-          if ([string]::IsNullOrWhiteSpace($repo)) {
-              throw "RML_REPO is not set"
-          }
+          Write-Host "Repository: $repo"
+          Write-Host "Release: $tag"
+          Write-Host "ABI: $env:RML_ABI"
+          Write-Host "RML commit: $env:RML_SHA"
 
           if (-not (Test-Path $zip)) {
-              throw "Release zip not found: $zip"
+            throw "Release zip not found: $zip"
           }
 
           if (-not (Test-Path "studio_theme_qt.dll")) {
-              throw "DLL not found: studio_theme_qt.dll"
+            throw "DLL not found: studio_theme_qt.dll"
           }
 
-          Write-Host "Publishing Studio Theme helper..."
-          Write-Host "Repository: $repo"
-          Write-Host "Release:    $tag"
-          Write-Host "ZIP:        $zip"
-          Write-Host "DLL:        studio_theme_qt.dll"
+          # Make sure the GitHub CLI is authenticated with the workflow token.
+          gh auth status
 
-          # Check whether the release already exists.
-          # --repo is required because the checkout lives in ./kit,
-          # not in the current working directory.
-          gh release view $tag --repo $repo 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub CLI authentication failed."
+          }
+
+          $notes = @"
+          Studio Theme native helper for RML_ABI_VERSION $env:RML_ABI.
+
+          Built against RML commit:
+          $env:RML_SHA
+
+          Download the zip, close Studio, and copy the RobloxModLoader folder
+          over your existing one.
+
+          If Studio's mod log says the helper was built against
+          RML_ABI_VERSION=X but the loader is RML_ABI_VERSION=Y, download
+          the Release named abi-Y instead.
+          "@
+
+          # Check whether the ABI Release already exists.
+          gh release view `
+            $tag `
+            --repo $repo `
+            2>$null
+
           $releaseExists = ($LASTEXITCODE -eq 0)
 
           if ($releaseExists) {
-              Write-Host "Release $tag already exists. Uploading assets..."
+            Write-Host "Release $tag already exists. Updating assets..."
 
-              gh release upload `
-                  $tag `
-                  $zip `
-                  studio_theme_qt.dll `
-                  --repo $repo `
-                  --clobber
+            gh release upload `
+              $tag `
+              $zip `
+              studio_theme_qt.dll `
+              --repo $repo `
+              --clobber
 
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Uploading release assets failed"
-              }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Uploading release assets failed."
+            }
 
-              Write-Host "Assets uploaded successfully."
+            gh release edit `
+              $tag `
+              --repo $repo `
+              --title "Helper for RML ABI $env:RML_ABI" `
+              --notes "$notes"
 
-              gh release edit `
-                  $tag `
-                  --repo $repo `
-                  --notes "$notes"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Updating release notes failed."
+            }
 
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Updating release notes failed"
-              }
-
-              Write-Host "Release notes updated successfully."
+            Write-Host "Release updated successfully."
           }
           else {
-              Write-Host "Release $tag does not exist. Creating it..."
+            Write-Host "Release $tag does not exist. Creating it..."
 
-              gh release create `
-                  $tag `
-                  $zip `
-                  studio_theme_qt.dll `
-                  --repo $repo `
-                  --title "Helper for RML ABI $env:RML_ABI" `
-                  --notes "$notes"
+            gh release create `
+              $tag `
+              $zip `
+              studio_theme_qt.dll `
+              --repo $repo `
+              --title "Helper for RML ABI $env:RML_ABI" `
+              --notes "$notes"
 
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Creating release failed"
-              }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Creating GitHub Release failed."
+            }
 
-              Write-Host "Release created successfully."
+            Write-Host "Release created successfully."
           }
 
           Write-Host ""

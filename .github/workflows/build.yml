@@ -155,7 +155,7 @@ jobs:
       # Cache the source, submodules, CMake cache, and compiled RML objects
       # per exact RML commit. The .git directory is excluded.
       #
-      # Increase v5 to intentionally force a fresh RML build.
+      # Increase v6 to intentionally force a fresh RML build.
       - name: Restore cached RML build
         id: cache
         uses: actions/cache@v4
@@ -163,7 +163,7 @@ jobs:
           path: |
             rml
             !rml/.git
-          key: rml-build-${{ env.RML_SHA }}-v5
+          key: rml-build-${{ env.RML_SHA }}-v6
 
       - name: Clone RML when cache is missing
         if: steps.cache.outputs.cache-hit != 'true'
@@ -234,10 +234,23 @@ jobs:
             throw "Helper CMake file was not found: $helperCmake"
           }
 
+          if (-not (Test-Path $env:HELPER_MAIN)) {
+            throw "Helper source file was not found: $env:HELPER_MAIN"
+          }
+
+          # Always remove and recreate this generated directory.
+          # A restored cache may contain a stale CMakeLists.txt without main.cpp.
+          if (Test-Path $exampleDir) {
+            Remove-Item `
+              -Path $exampleDir `
+              -Recurse `
+              -Force
+          }
+
           New-Item `
             -ItemType Directory `
-            -Force `
-            -Path $exampleDir |
+            -Path $exampleDir `
+            -Force |
             Out-Null
 
           Copy-Item `
@@ -250,11 +263,20 @@ jobs:
             -Destination "$exampleDir/CMakeLists.txt" `
             -Force
 
+          if (-not (Test-Path "$exampleDir/main.cpp")) {
+            throw "Failed to create $exampleDir/main.cpp"
+          }
+
+          if (-not (Test-Path "$exampleDir/CMakeLists.txt")) {
+            throw "Failed to create $exampleDir/CMakeLists.txt"
+          }
+
           $examplesCmake = Get-Content `
             -Path $examplesRoot `
             -Raw
 
-          if ($examplesCmake -notmatch "add_subdirectory\s*\(\s*studio_theme_qt\s*\)") {
+          if ($examplesCmake -notmatch `
+              "add_subdirectory\s*\(\s*studio_theme_qt\s*\)") {
             Add-Content `
               -Path $examplesRoot `
               -Value "`nadd_subdirectory(studio_theme_qt)`n" `
@@ -262,6 +284,8 @@ jobs:
           }
 
           Write-Host "Registered CMake target: studio_theme_qt_helper"
+          Write-Host "Generated source: $exampleDir/main.cpp"
+          Write-Host "Generated CMake file: $exampleDir/CMakeLists.txt"
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4

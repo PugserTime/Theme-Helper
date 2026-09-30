@@ -261,7 +261,7 @@ jobs:
               -Encoding utf8
           }
 
-          Write-Host "Registered CMake target: studio_theme_qt"
+          Write-Host "Registered CMake target: studio_theme_qt_helper"
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -295,7 +295,7 @@ jobs:
           cmake `
             --build build `
             --parallel `
-            --target studio_theme_qt
+            --target studio_theme_qt_helper
 
       - name: Locate and verify helper DLL ABI
         id: dll
@@ -306,12 +306,12 @@ jobs:
           $dll = Get-ChildItem `
             -Path "rml/build" `
             -Recurse `
-            -Filter "studio_theme_qt.dll" `
+            -Filter "studio_theme_qt_helper.dll" `
             -File |
             Select-Object -First 1
 
           if (-not $dll) {
-            throw "studio_theme_qt.dll was not produced by CMake."
+            throw "studio_theme_qt_helper.dll was not produced by CMake."
           }
 
           Write-Host "Found DLL: $($dll.FullName)"

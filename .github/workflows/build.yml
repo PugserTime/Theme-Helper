@@ -205,6 +205,6 @@ jobs:
             gh release upload $tag $zip studio_theme_qt.dll --clobber
             gh release edit $tag --notes "$notes"
           } else {
-            gh release create $tag $zip studio_theme_qt.dll --title "Helper for RML ABI $env:RML_ABI" --notes "$notes" --target ${{ github.sha }}
+            gh release create $tag $zip studio_theme_qt.dll --title "Helper for RML ABI $env:RML_ABI" --notes "$notes"
           }
           if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed" }

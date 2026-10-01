@@ -17,6 +17,30 @@
 
 using namespace rml::luau;
 
+// Static function pointer safely converts to LPCWSTR for GetModuleHandleExW
+static std::filesystem::path self_module_path()
+{
+#ifdef _WIN32
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&self_module_path),
+			&module))
+	{
+		return {};
+	}
+	wchar_t buffer[MAX_PATH]{};
+	const DWORD length = GetModuleFileNameW(module, buffer, MAX_PATH);
+	if (length == 0 || length == MAX_PATH)
+	{
+		return {};
+	}
+	return std::filesystem::path(buffer);
+#else
+	return {};
+#endif
+}
+
 class rml_updater final : public ModBase
 {
 	std::shared_ptr<spdlog::logger> m_log;
@@ -68,48 +92,44 @@ public:
 			return {true};
 		};
 
-		// Expose write_file for modern scripts
-		bridge.register_function("rml_updater", "write_file", write_fn);
+		// [[nodiscard]] return values are handled to prevent compiler warnings
+		auto reg1 = bridge.register_function("rml_updater", "write_file", write_fn);
+		if (!reg1) { m_log->debug("reg write_file: {}", reg1.error()); }
 
-		// Ping to let Luau know the disk helper is active
-		bridge.register_function("rml_updater", "ping", [](const BridgeArgs&) -> BridgeArgs {
+		auto reg2 = bridge.register_function("rml_updater", "ping", [](const BridgeArgs&) -> BridgeArgs {
 			return {true};
 		});
+		if (!reg2) { m_log->debug("reg ping: {}", reg2.error()); }
 
-		// Compatibility alias: if scripts call studio_theme_qt's stage_update, route it here
-		bridge.register_function("studio_theme_qt", "stage_update", [this, write_fn](const BridgeArgs& args) -> BridgeArgs {
+		auto reg3 = bridge.register_function("studio_theme_qt", "stage_update", [write_fn](const BridgeArgs& args) -> BridgeArgs {
 			const auto* bytes = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			if (!bytes || bytes->empty())
 				return {false, std::string{"no data"}};
 
-			// Find our own folder and write studio_theme_qt.dll directly
-			HMODULE mod = nullptr;
-			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			                   reinterpret_cast<LPCWSTR>(&rml_updater::register_bridge), &mod);
-			wchar_t buf[MAX_PATH]{};
-			GetModuleFileNameW(mod, buf, MAX_PATH);
+			auto self_path = self_module_path();
+			if (self_path.empty())
+				return {false, std::string{"could not determine self path"}};
 
-			namespace fs = std::filesystem;
-			fs::path self_path(buf);
-			fs::path target = self_path.parent_path() / "studio_theme_qt.dll";
-
+			auto target = self_path.parent_path() / "studio_theme_qt.dll";
 			std::string target_str = target.string();
 			return write_fn(BridgeArgs{target_str, *bytes});
 		});
+		if (!reg3) { m_log->debug("reg stage_update: {}", reg3.error()); }
 	}
 
 	void on_unload() override
 	{
 		if (auto* runtime = script_runtime()) {
-			runtime->bridge().unregister_function("rml_updater", "write_file");
-			runtime->bridge().unregister_function("rml_updater", "ping");
-			runtime->bridge().unregister_function("studio_theme_qt", "stage_update");
+			auto u1 = runtime->bridge().unregister_function("rml_updater", "write_file");
+			(void)u1;
+			auto u2 = runtime->bridge().unregister_function("rml_updater", "ping");
+			(void)u2;
+			auto u3 = runtime->bridge().unregister_function("studio_theme_qt", "stage_update");
+			(void)u3;
 		}
 	}
 };
 
-// Inspects the caller instruction inside roblox_modloader.dll to dynamically
-// extract the exact ABI version the loader is comparing against.
 static uint32_t detect_expected_loader_abi(void* ret_addr)
 {
 #ifdef _WIN32
@@ -117,30 +137,24 @@ static uint32_t detect_expected_loader_abi(void* ret_addr)
 	__try
 	{
 		const auto* p = reinterpret_cast<const uint8_t*>(ret_addr);
-		// Scan up to 48 bytes after the call instruction for common comparison opcodes
 		for (int i = 0; i < 48; ++i)
 		{
-			// 1. cmp eax, imm8  (83 F8 <imm8>)
 			if (p[i] == 0x83 && p[i + 1] == 0xF8) {
 				detected_abi = p[i + 2];
 				break;
 			}
-			// 2. cmp eax, imm32 (3D <imm32>)
 			if (p[i] == 0x3D) {
 				detected_abi = *reinterpret_cast<const uint32_t*>(&p[i + 1]);
 				break;
 			}
-			// 3. cmp eax, imm32 (81 F8 <imm32>)
 			if (p[i] == 0x81 && p[i + 1] == 0xF8) {
 				detected_abi = *reinterpret_cast<const uint32_t*>(&p[i + 2]);
 				break;
 			}
-			// 4. cmp [rbp+disp8], imm8 (83 7D <disp8> <imm8>)
 			if (p[i] == 0x83 && p[i + 1] == 0x7D) {
 				detected_abi = p[i + 3];
 				break;
 			}
-			// 5. cmp [rsp+disp8], imm8 (83 7C 24 <disp8> <imm8>)
 			if (p[i] == 0x83 && p[i + 1] == 0x7C && p[i + 2] == 0x24) {
 				detected_abi = p[i + 4];
 				break;
@@ -152,14 +166,14 @@ static uint32_t detect_expected_loader_abi(void* ret_addr)
 		detected_abi = 0;
 	}
 
-	// If detected within reasonable range (1 - 255), return it
 	if (detected_abi >= 1 && detected_abi <= 255)
 	{
 		return detected_abi;
 	}
+#else
+	(void)ret_addr;
 #endif
 
-	// Fallback to compile-time header version or current known default (6)
 #ifdef RML_ABI_VERSION
 	return RML_ABI_VERSION;
 #else
@@ -179,7 +193,6 @@ extern "C"
 		delete mod;
 	}
 
-	// Dynamically detects the loader's expected ABI and returns it
 	RML_MOD_ABI_EXPORT uint32_t rml_mod_abi_version()
 	{
 #ifdef _WIN32

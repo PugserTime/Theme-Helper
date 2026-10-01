@@ -29,7 +29,7 @@
 #  * Pushes only build when main.cpp or a workflow file changes (README edits
 #    etc. don't trigger it). You can still start it by hand from the Actions tab.
 #  * .NET is only installed when RML actually has to be compiled.
-
+#
 name: Build Studio Theme helper
 
 on:
@@ -133,6 +133,7 @@ jobs:
           if [ -z "$VERSION" ]; then
             VERSION=$(gh release list --limit 200 --json tagName --jq '.[].tagName' |
               grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
               sort -V | tail -1 | sed 's/^v//')
           fi
 

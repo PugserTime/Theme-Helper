@@ -55,6 +55,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -210,6 +211,21 @@ bool http_get(const std::string& url, std::string& body, int& status, std::size_
 		body.append(chunk.data(), read);
 	}
 	return true;
+}
+
+// Isolated SEH helper: contains no C++ objects with destructors to avoid C2712
+static bool safe_invoke_getter(void* getter_fn, const void* self, void* ret_storage)
+{
+	__try
+	{
+		using Getter = void* (*)(const void*, void*);
+		reinterpret_cast<Getter>(getter_fn)(self, ret_storage);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
 }
 #else
 bool http_get(const std::string&, std::string&, int& status, std::size_t, std::string& error)
@@ -521,19 +537,22 @@ public:
 		// =========================================================================
 		// 1. Core & Updater Functions (Zero Qt dependencies)
 		// =========================================================================
-		bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
+		auto r_ping = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
 			return {true};
 		});
+		(void)r_ping;
 
-		bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs {
+		auto r_version = bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs {
 			return {std::string{kHelperVersion}};
 		});
+		(void)r_version;
 
-		bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs {
+		auto r_abi = bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs {
 			return {std::to_string(kBuiltAbi)};
 		});
+		(void)r_abi;
 
-		bridge.register_function("studio_theme_qt", "check_update", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_check = bridge.register_function("studio_theme_qt", "check_update", [this](const BridgeArgs& args) -> BridgeArgs {
 			auto text = [&](std::size_t i) -> std::string {
 				if (i < args.size())
 				{
@@ -547,8 +566,9 @@ public:
 			start_check(text(0), text(1), text(2));
 			return {true};
 		});
+		(void)r_check;
 
-		bridge.register_function("studio_theme_qt", "download_update", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_dl = bridge.register_function("studio_theme_qt", "download_update", [this](const BridgeArgs& args) -> BridgeArgs {
 			auto text = [&](std::size_t i) -> std::string {
 				if (i < args.size())
 				{
@@ -562,8 +582,9 @@ public:
 			start_download(text(0), text(1), text(2));
 			return {true};
 		});
+		(void)r_dl;
 
-		bridge.register_function("studio_theme_qt", "install_pending", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_pend = bridge.register_function("studio_theme_qt", "install_pending", [this](const BridgeArgs& args) -> BridgeArgs {
 			const auto* target = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			if (!target || target->empty())
 			{
@@ -594,8 +615,9 @@ public:
 				return {std::string{"error"}, std::string{"unknown swap error"}};
 			}
 		});
+		(void)r_pend;
 
-		bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
+		auto r_save = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
 			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			const auto* text = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
 			if (!path || !text || path->empty())
@@ -632,8 +654,9 @@ public:
 				return {std::string{"save failed"}};
 			}
 		});
+		(void)r_save;
 
-		bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
+		auto r_load = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
 			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			if (!path || path->empty())
 			{
@@ -654,11 +677,12 @@ public:
 				return {std::string{}};
 			}
 		});
+		(void)r_load;
 
 		// =========================================================================
 		// 2. Qt Theming Functions (Safely guarded)
 		// =========================================================================
-		bridge.register_function("studio_theme_qt", "apply", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_apply = bridge.register_function("studio_theme_qt", "apply", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string css;
@@ -677,8 +701,9 @@ public:
 				return {false};
 			}
 		});
+		(void)r_apply;
 
-		bridge.register_function("studio_theme_qt", "scan", [this](const BridgeArgs&) -> BridgeArgs {
+		auto r_scan = bridge.register_function("studio_theme_qt", "scan", [this](const BridgeArgs&) -> BridgeArgs {
 			try
 			{
 				schedule_scan();
@@ -689,8 +714,9 @@ public:
 				return {false};
 			}
 		});
+		(void)r_scan;
 
-		bridge.register_function("studio_theme_qt", "pick_image", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_pick = bridge.register_function("studio_theme_qt", "pick_image", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string dir;
@@ -709,8 +735,9 @@ public:
 				return {false};
 			}
 		});
+		(void)r_pick;
 
-		bridge.register_function("studio_theme_qt", "install_image", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_inst = bridge.register_function("studio_theme_qt", "install_image", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				const auto* src = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
@@ -726,8 +753,9 @@ public:
 				return {std::string{}, std::string{"install_image exception"}};
 			}
 		});
+		(void)r_inst;
 
-		bridge.register_function("studio_theme_qt", "compose_topbar", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_comp = bridge.register_function("studio_theme_qt", "compose_topbar", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				auto text = [&](std::size_t i) -> std::string {
@@ -756,8 +784,9 @@ public:
 				return {false};
 			}
 		});
+		(void)r_comp;
 
-		bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_preset = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string names;
@@ -776,8 +805,9 @@ public:
 				return {false};
 			}
 		});
+		(void)r_preset;
 
-		bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r_restyle = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string css;
@@ -804,6 +834,7 @@ public:
 				return {false};
 			}
 		});
+		(void)r_restyle;
 
 		m_registered = true;
 		m_log->info("bridge functions registered successfully");
@@ -838,7 +869,8 @@ public:
 				{
 					try
 					{
-						bridge.unregister_function("studio_theme_qt", fn);
+						auto res = bridge.unregister_function("studio_theme_qt", fn);
+						(void)res;
 					}
 					catch (...)
 					{
@@ -926,8 +958,10 @@ private:
 					return;
 				}
 				auto& bridge = runtime->bridge();
-				bridge.set_shared(key, json);
-				bridge.emit(event, BridgeArgs{std::string{"ok"}});
+				auto stored = bridge.set_shared(key, json);
+				(void)stored;
+				auto emitted = bridge.emit(event, BridgeArgs{std::string{"ok"}});
+				(void)emitted;
 			}
 			catch (...)
 			{
@@ -987,7 +1021,6 @@ private:
 					break;
 				}
 
-				// Parse each release entry
 				std::size_t pos = 0;
 				while ((pos = body.find("\"tag_name\"", pos)) != std::string::npos)
 				{
@@ -1025,7 +1058,6 @@ private:
 						}
 						url_pos = end_url;
 
-						// Target asset check (exact ABI asset or requested asset)
 						if (!asset.empty() && ends_with(cand_url, "/" + asset))
 						{
 							best_url = cand_url;
@@ -1036,7 +1068,6 @@ private:
 							best_url = cand_url;
 							break;
 						}
-						// Fallback to standard studio_theme_qt.dll if compatible
 						if (ends_with(cand_url, "/studio_theme_qt.dll"))
 						{
 							fallback_url = cand_url;
@@ -1226,7 +1257,8 @@ private:
 		{
 			return;
 		}
-		runtime->bridge().emit("studio_theme.menu", BridgeArgs{action});
+		auto res = runtime->bridge().emit("studio_theme.menu", BridgeArgs{action});
+		(void)res;
 	}
 
 	void build_menu()
@@ -1242,18 +1274,28 @@ private:
 		{
 			return;
 		}
-		menu.add_action(m_menu_root, "Open / close Theme Editor", [this]() { send("open"); });
-		menu.add_action(m_menu_root, "Turn theme on / off", [this]() { send("toggle"); });
-		menu.add_separator(m_menu_root);
+		auto a1 = menu.add_action(m_menu_root, "Open / close Theme Editor", [this]() { send("open"); });
+		(void)a1;
+		auto a2 = menu.add_action(m_menu_root, "Turn theme on / off", [this]() { send("toggle"); });
+		(void)a2;
+		auto sep1 = menu.add_separator(m_menu_root);
+		(void)sep1;
 		m_menu_presets = menu.add_submenu(m_menu_root, "Presets");
 		m_preset_items.push_back(menu.add_action(m_menu_presets, "(loading...)", []() {}));
-		menu.add_separator(m_menu_root);
-		menu.add_action(m_menu_root, "Auto-match leftover colors on / off", [this]() { send("automatch"); });
-		menu.add_action(m_menu_root, "Reload background images", [this]() { send("reload_images"); });
-		menu.add_action(m_menu_root, "Re-apply theme everywhere", [this]() { send("refresh"); });
-		menu.add_separator(m_menu_root);
-		menu.add_action(m_menu_root, "Check for helper update", [this]() { send("check_update"); });
-		menu.add_action(m_menu_root, "Plain Studio (remove all theme colors)", [this]() { send("plain"); });
+		auto sep2 = menu.add_separator(m_menu_root);
+		(void)sep2;
+		auto a3 = menu.add_action(m_menu_root, "Auto-match leftover colors on / off", [this]() { send("automatch"); });
+		(void)a3;
+		auto a4 = menu.add_action(m_menu_root, "Reload background images", [this]() { send("reload_images"); });
+		(void)a4;
+		auto a5 = menu.add_action(m_menu_root, "Re-apply theme everywhere", [this]() { send("refresh"); });
+		(void)a5;
+		auto sep3 = menu.add_separator(m_menu_root);
+		(void)sep3;
+		auto a6 = menu.add_action(m_menu_root, "Check for helper update", [this]() { send("check_update"); });
+		(void)a6;
+		auto a7 = menu.add_action(m_menu_root, "Plain Studio (remove all theme colors)", [this]() { send("plain"); });
+		(void)a7;
 	}
 
 	void schedule_presets(std::string names)
@@ -1335,8 +1377,10 @@ private:
 					return;
 				}
 				auto& bridge = runtime->bridge();
-				bridge.set_shared("studio_theme.qt_scan", json);
-				bridge.emit("studio_theme.qt_scan_done", BridgeArgs{std::string{"ok"}});
+				auto stored = bridge.set_shared("studio_theme.qt_scan", json);
+				(void)stored;
+				auto emitted = bridge.emit("studio_theme.qt_scan_done", BridgeArgs{std::string{"ok"}});
+				(void)emitted;
 			}
 			catch (...)
 			{
@@ -1473,8 +1517,10 @@ private:
 			auto& bridge = runtime->bridge();
 			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",
 			                                     json_escape(key), json_escape(result), json_escape(error));
-			bridge.set_shared("studio_theme.topbar_image", json);
-			bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
+			auto stored = bridge.set_shared("studio_theme.topbar_image", json);
+			(void)stored;
+			auto emitted = bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
+			(void)emitted;
 		};
 
 		if (auto* qt = rml::qt::QtIntegration::instance())
@@ -1579,8 +1625,10 @@ private:
 			auto& bridge = runtime->bridge();
 			const std::string json = std::format("{{\"path\":\"{}\",\"error\":\"{}\"}}",
 			                                     json_escape(result_path), json_escape(error));
-			bridge.set_shared("studio_theme.picked_image", json);
-			bridge.emit("studio_theme.picked_image_done", BridgeArgs{std::string{"ok"}});
+			auto stored = bridge.set_shared("studio_theme.picked_image", json);
+			(void)stored;
+			auto emitted = bridge.emit("studio_theme.picked_image_done", BridgeArgs{std::string{"ok"}});
+			(void)emitted;
 		};
 
 		if (auto* qt = rml::qt::QtIntegration::instance())
@@ -1621,16 +1669,12 @@ private:
 			return {};
 		}
 
-		__try
-		{
-			rml::qt::QString result;
-			getter(widget, result.storage());
-			return result.to_utf8();
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
+		rml::qt::QString result;
+		if (!safe_invoke_getter(reinterpret_cast<void*>(getter), widget, result.storage()))
 		{
 			return {};
 		}
+		return result.to_utf8();
 #else
 		(void)widget;
 		return {};

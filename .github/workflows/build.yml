@@ -77,7 +77,7 @@ jobs:
           [ -n "$ABI" ] || { echo "Couldn't read RML_ABI_VERSION at $SHA (did RML move version.hpp?)."; exit 1; }
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "abi=$ABI" >> "$GITHUB_OUTPUT"
-          echo "RML $SHA reports ABI $ABI"
+          echo "RML $SHA reports ABI$ABI"
 
       - name: Determine helper version
         id: version
@@ -108,7 +108,7 @@ jobs:
           # First-ever release fallback.
           [ -n "$VERSION" ] || VERSION="1.0.0"
 
-          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! printf '%s' "$VERSION" \vert{} grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "Invalid helper version '$VERSION'. Expected X.Y.Z."
             exit 1
           fi
@@ -170,12 +170,12 @@ jobs:
           if (-not $match.Success) {
             throw "Couldn't find RML_ABI_VERSION in '$env:ABI_HEADER' at '$sha'."
           }
-          $abi = $match.Groups[1].Value
+          $abi =$match.Groups[1].Value
           Write-Host "Requested RML ref: $env:RML_REF"
           Write-Host "Resolved RML SHA: $sha"
           Write-Host "RML ABI version: $abi"
-          "sha=$sha" | Add-Content -Path $env:GITHUB_OUTPUT
-          "abi=$abi" | Add-Content -Path $env:GITHUB_OUTPUT
+          "sha=$sha" \vert{} Add-Content -Path $env:GITHUB_OUTPUT
+          "abi=$abi" \vert{} Add-Content -Path $env:GITHUB_OUTPUT
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -195,13 +195,13 @@ jobs:
           }
           $cl = (Get-Command cl -ErrorAction Stop).Source
           $ninja = (Get-Command ninja -ErrorAction Stop).Source
-          $text = "$env:VCToolsVersion|$env:WindowsSDKVersion|$cl|$ninja"
+          $text = "$env:VCToolsVersion\vert{}$env:WindowsSDKVersion|$cl\vert{}$ninja"
           $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
           $hash = [System.Security.Cryptography.SHA256]::HashData($bytes)
           $id = ([System.BitConverter]::ToString($hash) -replace "-", "").Substring(0, 10).ToLower()
           Write-Host "Toolchain: $text"
           Write-Host "Toolchain id: $id"
-          "id=$id" | Add-Content -Path $env:GITHUB_OUTPUT
+          "id=$id" \vert{} Add-Content -Path $env:GITHUB_OUTPUT
 
       - name: Restore cached RML build
         id: cache
@@ -264,13 +264,13 @@ jobs:
           Write-Host "Using $($main.FullName)"
           New-Item -ItemType Directory -Force "rml/examples/studio_theme_qt" | Out-Null
 
-          $source = Get-Content -Raw -Path $main.FullName
+          $source = Get-Content -Raw -Path$main.FullName
           $prefix = @"
 #define STUDIO_THEME_VERSION "$env:HELPER_VERSION"
 #define STUDIO_THEME_ABI $env:RML_ABI
 
 "@
-          Set-Content -Path "rml/examples/studio_theme_qt/main.cpp" -Value ($prefix + $source) -Encoding utf8
+          Set-Content -Path "rml/examples/studio_theme_qt/main.cpp" -Value ($prefix +$source) -Encoding utf8
 
       - name: Set up .NET (only when compiling RML)
         if: steps.cache.outputs.cache-hit != 'true'
@@ -295,7 +295,7 @@ jobs:
             Select-Object -First 1
           if (-not $dll) { throw "studio_theme_qt.dll wasn't built." }
           Write-Host "Built $($dll.FullName)"
-          "dll=$($dll.FullName)" | Add-Content -Path $env:GITHUB_OUTPUT
+          "dll=$($dll.FullName)" \vert{} Add-Content -Path $env:GITHUB_OUTPUT
 
       - name: Save RML build cache
         if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
@@ -314,15 +314,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $abi = [int]$env:RML_ABI
-          $expected = [byte[]](
-            0xB8,
-            ($abi -band 0xFF),
-            (($abi -shr 8) -band 0xFF),
-            (($abi -shr 16) -band 0xFF),
-            (($abi -shr 24) -band 0xFF),
-            0xC3
-          )
-          $needle = -join ($expected | ForEach-Object { [char]$_ })
+          $expected = [byte[]](             0xB8,             ($abi -band 0xFF),
+            (($abi -shr 8) -band 0xFF),             (($abi -shr 16) -band 0xFF),
+            (($abi -shr 24) -band 0xFF),             0xC3           )$needle = -join ($expected \vert{} ForEach-Object { [char]$_ })
           $text = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($env:DLL))
           if (-not $text.Contains($needle)) {
             throw "The DLL does not appear to report RML_ABI_VERSION $abi. Refusing to publish it."
@@ -395,13 +389,7 @@ jobs:
             gh release delete $tag --yes --cleanup-tag
             if ($LASTEXITCODE -ne 0) { throw "Couldn't replace the previous $tag release." }
           }
-          gh release create $tag `
-            "dist/studio_theme_qt.dll" `
-            "dist/studio_theme_helper_abi$env:RML_ABI-v$env:HELPER_VERSION.zip" `
-            --target $env:GITHUB_SHA `
-            --title "Studio Theme helper (RML ABI $env:RML_ABI)" `
-            --notes-file notes.md `
-            --latest
+          gh release create $tag "dist/studio_theme_qt.dll" "dist/studio_theme_helper_abi$env:RML_ABI-v$env:HELPER_VERSION.zip" --target $env:GITHUB_SHA --title "Studio Theme helper (RML ABI $env:RML_ABI)" --notes-file notes.md --latest
           if ($LASTEXITCODE -ne 0) { throw "Couldn't create the release." }
 
           $url = gh release view $tag --json url --jq ".url"

@@ -47,6 +47,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,7 +65,7 @@ using namespace rml::luau;
 namespace
 {
 #ifndef STUDIO_THEME_HELPER_BASE
-#define STUDIO_THEME_HELPER_BASE "1.2"
+#define STUDIO_THEME_HELPER_BASE "1.3"
 #endif
 #ifndef STUDIO_THEME_HELPER_VERSION
 #define STUDIO_THEME_HELPER_VERSION STUDIO_THEME_HELPER_BASE ".0"
@@ -382,6 +383,40 @@ bool swap_in(const std::filesystem::path& target, const std::filesystem::path& s
 	return true;
 }
 
+bool contains_any(std::string_view text, std::initializer_list<std::string_view> needles)
+{
+	for (const auto needle : needles)
+	{
+		if (text.find(needle) != std::string_view::npos)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// Input-like widgets: line edits, combo boxes, spin boxes and Studio's own
+// filter/search boxes (whose exact class names aren't known in advance, e.g. the
+// Properties filter). They often carry their own stylesheet, which Qt prefers over
+// the application-wide one, so they are restyled directly with a small color-only
+// sheet. Anything that looks like a button, menu, dropdown group or ribbon piece is
+// NOT an input, and Properties' value editors (not filter/search boxes) stay plain.
+bool looks_like_input(std::string_view cls)
+{
+	if (contains_any(cls, {"Ribbon", "Button", "Menu", "Dropdown", "Group", "Label", "Tab", "ScriptEditor", "CodeEdit"}))
+	{
+		return false;
+	}
+	const bool filterish = contains_any(cls, {"Filter", "Search"});
+	if (!filterish && contains_any(cls, {"Propert", "Editor"}))
+	{
+		return false;
+	}
+	return contains_any(cls, {"LineEdit", "TextEdit", "ComboBox", "SpinBox", "FilterBox", "FilterEdit",
+	                          "FilterCombo", "FilterBar", "SearchBox", "SearchEdit", "SearchBar", "SearchCombo",
+	                          "CommandBarEdit", "CommandLine"});
+}
+
 int parse_tag_abi(const std::string& tag)
 {
 	const std::string needle = "-abi";
@@ -411,6 +446,7 @@ class studio_theme_qt final : public ModBase
 	std::string m_css;
 	std::string m_restyle_css;
 	std::string m_restyle_allow;
+	std::string m_restyle_leaf;
 	bool m_wanted = false;
 	bool m_captured = false;
 	std::mutex m_register_mutex;
@@ -431,7 +467,8 @@ class studio_theme_qt final : public ModBase
 	    "OutputWidgetRibbon\nOutputFilterTextEdit\nOutputFindSearchBar\nOutputRibbonCombinedFilterDropdown\n"
 	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
 	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu\nQtitan::RibbonMenu\nQtitan::Menu\n"
-	    "RBX::Studio::LogOutMenu";
+	    "RBX::Studio::LogOutMenu\nQStatusBar\nRBX::Studio::CommandBarButton\nRBX::Studio::CommandBarButtonContainer\n"
+	    "RBX::Studio::CommandBarHistoryListWidget";
 
 public:
 	studio_theme_qt()
@@ -806,6 +843,7 @@ public:
 			{
 				std::string css;
 				std::string allow;
+				std::string leaf;
 				if (args.size() > 0)
 				{
 					if (const auto* text = std::get_if<std::string>(&args[0]))
@@ -820,7 +858,14 @@ public:
 						allow = *text;
 					}
 				}
-				schedule_restyle(std::move(css), std::move(allow));
+				if (args.size() > 2)
+				{
+					if (const auto* text = std::get_if<std::string>(&args[2]))
+					{
+						leaf = *text;
+					}
+				}
+				schedule_restyle(std::move(css), std::move(allow), std::move(leaf));
 				return {true};
 			}
 			catch (...)
@@ -1231,7 +1276,7 @@ private:
 		{
 			return;
 		}
-		std::string r_css, r_allow;
+		std::string r_css, r_allow, r_leaf;
 		{
 			std::lock_guard lock(m_mutex);
 			if (m_wanted && app->style_sheet().find(kSheetMarker) == std::string::npos)
@@ -1241,11 +1286,12 @@ private:
 			}
 			r_css = m_restyle_css;
 			r_allow = m_restyle_allow;
+			r_leaf = m_restyle_leaf;
 		}
 		// Periodically re-ensure menus and dynamic dropdowns keep their theme
 		if (!r_css.empty())
 		{
-			restyle_widgets_now(r_css, r_allow);
+			restyle_widgets_now(r_css, r_allow, r_leaf);
 		}
 	}
 
@@ -1695,10 +1741,10 @@ private:
 		});
 	}
 
-	void restyle_widgets_now(const std::string& css, const std::string& allow_text)
+	void restyle_widgets_now(const std::string& css, const std::string& allow_text, const std::string& leaf_css)
 	{
 		auto alive = m_alive;
-		auto task = [this, alive, css, allow_text]() {
+		auto task = [this, alive, css, allow_text, leaf_css]() {
 			if (!alive->load())
 			{
 				return;
@@ -1735,7 +1781,13 @@ private:
 
 					std::string_view clsView(cls);
 					const bool isMenu = (clsView.find("Menu") != std::string_view::npos && clsView.find("MenuBar") == std::string_view::npos);
-					const bool allowed = !css.empty() && (allow.count(cls) > 0 || isMenu);
+					const bool listed = allow.count(cls) > 0;
+					// Input boxes (Properties filter etc.) get the small color-only sheet: it's cheap
+					// and reaches inputs whose class name isn't known. Anything on the allow list or
+					// menu-like keeps the full sheet.
+					const bool isInput = !isMenu && !listed && !leaf_css.empty() && looks_like_input(clsView);
+					const bool allowed = !css.empty() && (listed || isMenu || isInput);
+					const std::string& applied = isInput ? leaf_css : css;
 
 					const std::string own = widget_style_sheet(widget);
 
@@ -1754,8 +1806,8 @@ private:
 
 					// Ensure menus and dropdowns are themed directly even if they had no prior stylesheet
 					const std::string base = own.empty() ? "" : strip_ours(own);
-					const std::string want = base.empty() ? (std::string(kBegin) + css + std::string(kEnd))
-					                                      : (base + std::string(kBegin) + css + std::string(kEnd));
+					const std::string want = base.empty() ? (std::string(kBegin) + applied + std::string(kEnd))
+					                                      : (base + std::string(kBegin) + applied + std::string(kEnd));
 					if (want != own)
 					{
 						widget->setStyleSheet(rml::qt::QString(want));
@@ -1777,14 +1829,15 @@ private:
 		}
 	}
 
-	void schedule_restyle(std::string css, std::string allow_text)
+	void schedule_restyle(std::string css, std::string allow_text, std::string leaf_css)
 	{
 		{
 			std::lock_guard lock(m_mutex);
 			m_restyle_css = css;
 			m_restyle_allow = allow_text;
+			m_restyle_leaf = leaf_css;
 		}
-		restyle_widgets_now(css, allow_text);
+		restyle_widgets_now(css, allow_text, leaf_css);
 	}
 
 	void schedule(std::string css)

@@ -1,9 +1,25 @@
 # Builds the Studio Theme native helper (studio_theme_qt.dll) on GitHub's
 # Windows servers and PUBLISHES it as a GitHub Release.
 #
-# Download it: repo page > "Releases" (right sidebar) > "Studio Theme helper
-# (RML ABI N)". Direct link, always the newest build for that ABI:
-#   https://github.com/<you>/<repo>/releases/download/helper-abi<N>/studio_theme_qt.dll
+# VERSION NUMBERS (automatic)
+#   version = <BASE>.<BUILD>      e.g.  1.2.57
+#   BASE    = the "major.minor" in main.cpp (#define STUDIO_THEME_HELPER_BASE).
+#             The only part you edit by hand: bump it when the scripts need a
+#             new feature from the helper.
+#   BUILD   = this repo's commit count, so every commit gets a higher number and
+#             nothing has to be edited. The same commit always gets the same one.
+#   The version is compiled into the DLL (the mod's Settings tab shows it) and
+#   becomes the release tag:  v<version>-abi<N>   e.g.  v1.2.57-abi5
+#   (N = the RML_ABI_VERSION it was built for). The mod's updater compares these
+#   numbers to decide whether an update exists.
+#
+# Download: repo page > "Releases". Each release has
+#   studio_theme_qt.dll            (put it in  mods\studio_theme\native\)
+#   studio_theme_qt_abi<N>.dll     (same file; what the in-mod updater downloads,
+#                                   so it never picks a DLL built for another ABI)
+#   studio_theme_helper_*.zip      (the RobloxModLoader folder layout)
+# The newest one is also at .../releases/latest/download/studio_theme_qt.dll
+# The newest 5 releases per ABI are kept; older ones are removed automatically.
 #
 # Auto-update: GitHub can't notify this repo when RML changes (it isn't your
 # repo), so a tiny Linux job "watches" RML once an hour. It reads RML's latest
@@ -101,9 +117,10 @@ jobs:
         run: |
           BUILD=true
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            if gh release view "helper-abi${{ steps.rml.outputs.abi }}" >/dev/null 2>&1; then
+            # any release for this ABI counts: v1.2.57-abi5, or the old helper-abi5
+            if gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -qE -- "-abi${{ steps.rml.outputs.abi }}$"; then
               BUILD=false
-              echo "Release helper-abi${{ steps.rml.outputs.abi }} already exists - nothing to do."
+              echo "A release for ABI ${{ steps.rml.outputs.abi }} already exists - nothing to do."
             else
               echo "RML ABI ${{ steps.rml.outputs.abi }} has no release yet - building."
             fi
@@ -132,6 +149,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: kit
+          fetch-depth: 0 # full history: the commit count is the build number
 
       - name: Resolve RML commit and ABI
         id: rml
@@ -161,6 +179,36 @@ jobs:
           Write-Host "RML ABI version: $abi"
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "abi=$abi" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      # <BASE> from main.cpp + <commit count> = the version. Nothing to edit.
+      - name: Work out the version number
+        id: version
+        shell: pwsh
+        env:
+          RML_ABI: ${{ steps.rml.outputs.abi }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $main = Get-ChildItem kit -Recurse -Filter main.cpp -File |
+            Where-Object { Select-String -Path $_.FullName -Pattern "studio_theme_qt" -Quiet } |
+            Select-Object -First 1
+          if (-not $main) {
+            throw "Couldn't find main.cpp in your repo. Upload the helper main.cpp, then run this workflow again."
+          }
+          $m = Select-String -Path $main.FullName -Pattern '#define\s+STUDIO_THEME_HELPER_BASE\s+"(\d+\.\d+)"' | Select-Object -First 1
+          if (-not $m) {
+            throw 'main.cpp has no  #define STUDIO_THEME_HELPER_BASE "x.y"  line - the workflow needs it to build the version number.'
+          }
+          $base = $m.Matches[0].Groups[1].Value
+          $count = (git -C kit rev-list --count HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $count) { throw "Couldn't count commits." }
+          $version = "$base.$count"
+          $tag = "v$version-abi$env:RML_ABI"
+          Write-Host "Helper version: $version  (base $base, build $count)"
+          Write-Host "Release tag:    $tag"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "main=$($main.FullName)" >> $env:GITHUB_OUTPUT
           exit 0
 
       # Compiler first: its version goes into the cache key below.
@@ -241,21 +289,21 @@ jobs:
           }
           exit 0
 
-      - name: Add the helper
+      # Copies main.cpp into RML's examples and puts the version on its first
+      # line (#line 1 keeps compiler error line numbers matching your file).
+      - name: Add the helper (with its version number)
         shell: pwsh
+        env:
+          MAIN: ${{ steps.version.outputs.main }}
+          HELPER_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $main = Get-ChildItem kit -Recurse -Filter main.cpp -File |
-            Where-Object {
-              Select-String -Path $_.FullName -Pattern "studio_theme_qt" -Quiet
-            } |
-            Select-Object -First 1
-          if (-not $main) {
-            throw "Couldn't find main.cpp in your repo. Upload the helper main.cpp, then run this workflow again."
-          }
-          Write-Host "Using $($main.FullName)"
+          Write-Host "Using $env:MAIN"
           New-Item -ItemType Directory -Force "rml/examples/studio_theme_qt" | Out-Null
-          Copy-Item -Path $main.FullName -Destination "rml/examples/studio_theme_qt/main.cpp" -Force
+          $head = [System.Text.Encoding]::ASCII.GetBytes("#define STUDIO_THEME_HELPER_VERSION `"$env:HELPER_VERSION`"`n#line 1`n")
+          $body = [System.IO.File]::ReadAllBytes($env:MAIN)
+          $dest = Join-Path (Get-Location) "rml/examples/studio_theme_qt/main.cpp"
+          [System.IO.File]::WriteAllBytes($dest, [byte[]]($head + $body))
           exit 0
 
       # Only needed to configure RML's CMake, i.e. when compiling it fresh.
@@ -296,12 +344,14 @@ jobs:
             !rml/.git
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
-      # The DLL must contain rml_abi_version(): mov eax, <ABI>; ret.
+      # The DLL must (1) report the RML ABI it was built for - rml_abi_version()
+      # is  mov eax, <ABI>; ret  - and (2) contain the version string we injected.
       # (Searches a Latin-1 string: much faster than looping over the bytes.)
-      - name: Verify helper ABI
+      - name: Verify the helper (ABI + version)
         shell: pwsh
         env:
           RML_ABI: ${{ steps.rml.outputs.abi }}
+          HELPER_VERSION: ${{ steps.version.outputs.version }}
           DLL: ${{ steps.build.outputs.dll }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -320,6 +370,10 @@ jobs:
             throw "The DLL does not appear to report RML_ABI_VERSION $abi. Refusing to publish it."
           }
           Write-Host "ABI check passed: studio_theme_qt.dll reports ABI $abi."
+          if (-not $text.Contains($env:HELPER_VERSION)) {
+            throw "The DLL doesn't contain version $env:HELPER_VERSION - the version injection didn't work. Refusing to publish it."
+          }
+          Write-Host "Version check passed: studio_theme_qt.dll reports $env:HELPER_VERSION."
           exit 0
 
       - name: Package
@@ -327,6 +381,7 @@ jobs:
         env:
           RML_SHA: ${{ steps.rml.outputs.sha }}
           RML_ABI: ${{ steps.rml.outputs.abi }}
+          HELPER_VERSION: ${{ steps.version.outputs.version }}
           DLL: ${{ steps.build.outputs.dll }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -334,8 +389,10 @@ jobs:
           New-Item -ItemType Directory -Force $nativePath, "dist" | Out-Null
           Copy-Item -Path $env:DLL -Destination "$nativePath/studio_theme_qt.dll" -Force
           Copy-Item -Path $env:DLL -Destination "dist/studio_theme_qt.dll" -Force
+          # same bytes, ABI-specific name: what the in-mod updater downloads
+          Copy-Item -Path $env:DLL -Destination "dist/studio_theme_qt_abi$env:RML_ABI.dll" -Force
           $install = @(
-            "Studio Theme native helper",
+            "Studio Theme native helper $env:HELPER_VERSION",
             "Built for RML_ABI_VERSION: $env:RML_ABI",
             "Built against RML commit: $env:RML_SHA",
             "",
@@ -348,25 +405,26 @@ jobs:
             "than your loader, run the Build workflow again with your RML version."
           ) -join "`n"
           Set-Content -Path "out/INSTALL.txt" -Value $install -Encoding utf8
-          Compress-Archive -Path "out/*" -DestinationPath "dist/studio_theme_helper_abi$env:RML_ABI.zip" -Force
+          Compress-Archive -Path "out/*" -DestinationPath "dist/studio_theme_helper_v$($env:HELPER_VERSION)_abi$env:RML_ABI.zip" -Force
           Get-ChildItem dist | ForEach-Object { Write-Host "  $($_.Name)  ($($_.Length) bytes)" }
           exit 0
 
-      # One release per ABI, tagged helper-abi<N>, always holding the newest
-      # build - so the download link never changes. It's marked "latest", so
-      # .../releases/latest/download/studio_theme_qt.dll works too.
+      # One release per build, tagged v<version>-abi<N>. The in-mod updater reads
+      # the version from the tag. The newest 5 per ABI are kept.
       - name: Publish release
         id: release
         shell: pwsh
         env:
           RML_SHA: ${{ steps.rml.outputs.sha }}
           RML_ABI: ${{ steps.rml.outputs.abi }}
+          HELPER_VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "helper-abi$env:RML_ABI"
+          $tag = $env:TAG
           $repo = $env:GITHUB_REPOSITORY
           $notes = @(
-            "Native helper (studio_theme_qt.dll) for the Studio Theme mod.",
+            "Native helper (studio_theme_qt.dll) $env:HELPER_VERSION for the Studio Theme mod.",
             "",
             "Built for RML_ABI_VERSION $env:RML_ABI, against RML commit $env:RML_SHA.",
             "Built from this repo at commit $env:GITHUB_SHA.",
@@ -374,9 +432,10 @@ jobs:
             "Install (close Studio first), either:",
             "1) download studio_theme_qt.dll and put it in  RobloxModLoader\mods\studio_theme\native\",
             "2) or download the zip and copy its RobloxModLoader folder over your existing one.",
+            "(studio_theme_qt_abi$env:RML_ABI.dll is the same file; it is what the in-mod updater downloads.)",
             "",
-            "Direct link (always the newest build for this ABI):",
-            "https://github.com/$repo/releases/download/$tag/studio_theme_qt.dll",
+            "Direct link to the newest build:",
+            "https://github.com/$repo/releases/latest/download/studio_theme_qt.dll",
             "",
             "If the mod log says the helper was built for a different RML_ABI_VERSION than your",
             "loader, run the Build workflow again with your RML version."
@@ -386,14 +445,16 @@ jobs:
           $tags = @(gh release list --limit 200 --json tagName --jq ".[].tagName")
           if ($LASTEXITCODE -ne 0) { throw "Couldn't list releases (does the workflow have write access?)." }
           if ($tags -contains $tag) {
+            # same version + ABI built again (e.g. a manual run): replace it
             gh release delete $tag --yes --cleanup-tag
             if ($LASTEXITCODE -ne 0) { throw "Couldn't replace the previous $tag release." }
           }
           gh release create $tag `
             "dist/studio_theme_qt.dll" `
-            "dist/studio_theme_helper_abi$env:RML_ABI.zip" `
+            "dist/studio_theme_qt_abi$env:RML_ABI.dll" `
+            "dist/studio_theme_helper_v$($env:HELPER_VERSION)_abi$env:RML_ABI.zip" `
             --target $env:GITHUB_SHA `
-            --title "Studio Theme helper (RML ABI $env:RML_ABI)" `
+            --title "Studio Theme helper $env:HELPER_VERSION (RML ABI $env:RML_ABI)" `
             --notes-file notes.md `
             --latest
           if ($LASTEXITCODE -ne 0) { throw "Couldn't create the release." }
@@ -401,12 +462,25 @@ jobs:
           $url = gh release view $tag --json url --jq ".url"
           Write-Host "Published: $url"
           @(
-            "### Published",
+            "### Published helper $env:HELPER_VERSION",
             "",
             "Release: $url",
             "",
-            "Direct download: https://github.com/$repo/releases/download/$tag/studio_theme_qt.dll"
+            "Newest build: https://github.com/$repo/releases/latest/download/studio_theme_qt.dll"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+
+          # Keep the newest 5 releases for this ABI; remove older ones (and their tags).
+          # Never fails the build: the new release is already published.
+          try {
+            $filter = "[.[] | select(.tagName | endswith(`"-abi$env:RML_ABI`"))] | sort_by(.createdAt) | reverse | .[].tagName"
+            $mine = @(gh release list --limit 200 --json tagName,createdAt --jq $filter)
+            foreach ($old in ($mine | Select-Object -Skip 5)) {
+              Write-Host "Removing old release $old"
+              gh release delete $old --yes --cleanup-tag
+            }
+          } catch {
+            Write-Warning "Couldn't tidy old releases: $_"
+          }
           exit 0
 
       # Only if publishing failed (e.g. the repo forbids the workflow from

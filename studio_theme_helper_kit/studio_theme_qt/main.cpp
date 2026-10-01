@@ -77,7 +77,7 @@ using namespace rml::luau;
 
 namespace
 {
-constexpr const char* kHelperVersion = "1.1.0";
+constexpr const char* kHelperVersion = "1.1.1";
 constexpr const char* kSheetMarker = "/* studio_theme */";
 
 #ifdef _WIN32

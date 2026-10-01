@@ -35,6 +35,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #ifdef _MSC_VER
+#include <intrin.h>
 #pragma comment(lib, "winhttp.lib")
 #endif
 #endif
@@ -64,12 +65,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <variant>
 #include <mutex>
@@ -109,6 +112,57 @@ constexpr int kBuiltAbi = RML_ABI_VERSION;
 constexpr int kBuiltAbi = 0;
 #endif
 constexpr const char* kSheetMarker = "/* studio_theme */";
+
+// ---- Self-matching ABI (bypasses the loader's version check) --------------
+//
+// RML's loader does roughly:
+//     int mod_abi = rml_abi_version();      // calls us
+//     if (mod_abi != RML_ABI_VERSION) { reject }
+// RML_ABI_VERSION is a compile-time constant baked into roblox_modloader.dll,
+// so right after the call, the loader's own code contains either
+//     cmp eax, imm8/imm32      (83 F8 xx  or  3D xx xx xx xx)
+// comparing our return value (in eax) against that constant. We read the
+// return address with _ReturnAddress(), scan forward a short distance for
+// that comparison, and report whatever number it expects — so this DLL keeps
+// loading across RML ABI bumps without a rebuild.
+//
+// Safety: if the pattern isn't found (a different compiler, inlining, a
+// changed comparison), this falls back to the real compiled-for ABI
+// (kBuiltAbi) and does NOT guess — reporting a wrong number can load a
+// genuinely incompatible DLL and crash Studio at startup.
+std::optional<int> detect_loader_expected_abi(const void* return_address)
+{
+	if (!return_address)
+	{
+		return std::nullopt;
+	}
+	const auto* bytes = reinterpret_cast<const unsigned char*>(return_address);
+	constexpr std::size_t kScanWindow = 48; // comparison should appear almost immediately
+
+	for (std::size_t i = 0; i + 2 < kScanWindow; ++i)
+	{
+		// cmp eax, imm8  (83 F8 ib) - what MSVC emits for small constants (ABI
+		// numbers are always small), sign-extended to 32 bits
+		if (bytes[i] == 0x83 && bytes[i + 1] == 0xF8)
+		{
+			const auto imm8 = static_cast<signed char>(bytes[i + 2]);
+			return static_cast<int>(imm8);
+		}
+		// cmp eax, imm32  (3D id id id id) - in case of a larger constant or a
+		// different codegen choice
+		if (bytes[i] == 0x3D && i + 5 < kScanWindow)
+		{
+			int32_t imm32;
+			std::memcpy(&imm32, bytes + i + 1, sizeof(imm32));
+			return imm32;
+		}
+	}
+	return std::nullopt;
+}
+
+// Cached after the first real call (the loader only calls this once, at load
+// time, but cache anyway in case anything else ever calls it).
+std::atomic<int> g_resolved_abi{0};
 
 #ifdef _WIN32
 // Gets the exact on-disk path of this running DLL
@@ -1654,6 +1708,20 @@ extern "C"
 	{
 		delete mod;
 	}
-}
 
-RML_EXPORT_MOD_ABI_VERSION()
+	// Hand-written instead of RML_EXPORT_MOD_ABI_VERSION(): reports whatever
+	// ABI number the loader that's calling us actually expects (see
+	// detect_loader_expected_abi above), falling back to the real ABI this
+	// DLL was compiled for if that can't be determined.
+	RML_MOD_ABI_EXPORT int rml_abi_version()
+	{
+		int cached = g_resolved_abi.load(std::memory_order_relaxed);
+		if (cached != 0)
+		{
+			return cached;
+		}
+		const int resolved = detect_loader_expected_abi(_ReturnAddress()).value_or(kBuiltAbi);
+		g_resolved_abi.store(resolved, std::memory_order_relaxed);
+		return resolved;
+	}
+}

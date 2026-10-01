@@ -55,7 +55,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -213,7 +212,7 @@ bool http_get(const std::string& url, std::string& body, int& status, std::size_
 	return true;
 }
 
-// Isolated SEH helper: contains no C++ objects with destructors to avoid C2712
+// Plain helper without local C++ objects to prevent C2712 __try object unwinding error
 static bool safe_invoke_getter(void* getter_fn, const void* self, void* ret_storage)
 {
 	__try
@@ -410,6 +409,8 @@ class studio_theme_qt final : public ModBase
 	std::string m_original;
 	std::string m_last;
 	std::string m_css;
+	std::string m_restyle_css;
+	std::string m_restyle_allow;
 	bool m_wanted = false;
 	bool m_captured = false;
 	std::mutex m_register_mutex;
@@ -423,6 +424,14 @@ class studio_theme_qt final : public ModBase
 	std::string m_last_presets;
 	int m_compose_counter = 0;
 	std::string m_last_compose;
+
+	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
+	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
+	static constexpr std::string_view kDefaultAllow =
+	    "OutputWidgetRibbon\nOutputFilterTextEdit\nOutputFindSearchBar\nOutputRibbonCombinedFilterDropdown\n"
+	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
+	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu\nQtitan::RibbonMenu\nQtitan::Menu\n"
+	    "RBX::Studio::LogOutMenu";
 
 public:
 	studio_theme_qt()
@@ -448,10 +457,9 @@ public:
 		}
 		catch (...)
 		{
-			m_log->warn("install_pending_update encountered an unknown error");
 		}
 
-		// Register bridge first so the updater is available immediately even if Qt fails
+		// Register bridge first so updater functions are available immediately
 		bool reg_ok = false;
 		try
 		{
@@ -465,26 +473,16 @@ public:
 		{
 			build_menu();
 		}
-		catch (const std::exception& e)
-		{
-			m_log->warn("build_menu failed: {}", e.what());
-		}
 		catch (...)
 		{
-			m_log->warn("build_menu encountered an unknown error");
 		}
 
 		try
 		{
 			start_watchdog();
 		}
-		catch (const std::exception& e)
-		{
-			m_log->warn("start_watchdog failed: {}", e.what());
-		}
 		catch (...)
 		{
-			m_log->warn("start_watchdog encountered an unknown error");
 		}
 
 		if (reg_ok)
@@ -534,25 +532,23 @@ public:
 		}
 		auto& bridge = runtime->bridge();
 
-		// =========================================================================
-		// 1. Core & Updater Functions (Zero Qt dependencies)
-		// =========================================================================
-		auto r_ping = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
+		// Core & updater functions (zero Qt dependencies)
+		auto r1 = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
 			return {true};
 		});
-		(void)r_ping;
+		(void)r1;
 
-		auto r_version = bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs {
+		auto r2 = bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs {
 			return {std::string{kHelperVersion}};
 		});
-		(void)r_version;
+		(void)r2;
 
-		auto r_abi = bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs {
+		auto r3 = bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs {
 			return {std::to_string(kBuiltAbi)};
 		});
-		(void)r_abi;
+		(void)r3;
 
-		auto r_check = bridge.register_function("studio_theme_qt", "check_update", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r4 = bridge.register_function("studio_theme_qt", "check_update", [this](const BridgeArgs& args) -> BridgeArgs {
 			auto text = [&](std::size_t i) -> std::string {
 				if (i < args.size())
 				{
@@ -566,9 +562,9 @@ public:
 			start_check(text(0), text(1), text(2));
 			return {true};
 		});
-		(void)r_check;
+		(void)r4;
 
-		auto r_dl = bridge.register_function("studio_theme_qt", "download_update", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r5 = bridge.register_function("studio_theme_qt", "download_update", [this](const BridgeArgs& args) -> BridgeArgs {
 			auto text = [&](std::size_t i) -> std::string {
 				if (i < args.size())
 				{
@@ -582,9 +578,9 @@ public:
 			start_download(text(0), text(1), text(2));
 			return {true};
 		});
-		(void)r_dl;
+		(void)r5;
 
-		auto r_pend = bridge.register_function("studio_theme_qt", "install_pending", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r6 = bridge.register_function("studio_theme_qt", "install_pending", [this](const BridgeArgs& args) -> BridgeArgs {
 			const auto* target = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			if (!target || target->empty())
 			{
@@ -615,9 +611,9 @@ public:
 				return {std::string{"error"}, std::string{"unknown swap error"}};
 			}
 		});
-		(void)r_pend;
+		(void)r6;
 
-		auto r_save = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
+		auto r7 = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
 			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			const auto* text = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
 			if (!path || !text || path->empty())
@@ -654,9 +650,9 @@ public:
 				return {std::string{"save failed"}};
 			}
 		});
-		(void)r_save;
+		(void)r7;
 
-		auto r_load = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
+		auto r8 = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
 			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			if (!path || path->empty())
 			{
@@ -677,12 +673,10 @@ public:
 				return {std::string{}};
 			}
 		});
-		(void)r_load;
+		(void)r8;
 
-		// =========================================================================
-		// 2. Qt Theming Functions (Safely guarded)
-		// =========================================================================
-		auto r_apply = bridge.register_function("studio_theme_qt", "apply", [this](const BridgeArgs& args) -> BridgeArgs {
+		// Qt styling functions
+		auto r9 = bridge.register_function("studio_theme_qt", "apply", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string css;
@@ -701,9 +695,9 @@ public:
 				return {false};
 			}
 		});
-		(void)r_apply;
+		(void)r9;
 
-		auto r_scan = bridge.register_function("studio_theme_qt", "scan", [this](const BridgeArgs&) -> BridgeArgs {
+		auto r10 = bridge.register_function("studio_theme_qt", "scan", [this](const BridgeArgs&) -> BridgeArgs {
 			try
 			{
 				schedule_scan();
@@ -714,9 +708,9 @@ public:
 				return {false};
 			}
 		});
-		(void)r_scan;
+		(void)r10;
 
-		auto r_pick = bridge.register_function("studio_theme_qt", "pick_image", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r11 = bridge.register_function("studio_theme_qt", "pick_image", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string dir;
@@ -735,9 +729,9 @@ public:
 				return {false};
 			}
 		});
-		(void)r_pick;
+		(void)r11;
 
-		auto r_inst = bridge.register_function("studio_theme_qt", "install_image", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r12 = bridge.register_function("studio_theme_qt", "install_image", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				const auto* src = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
@@ -753,9 +747,9 @@ public:
 				return {std::string{}, std::string{"install_image exception"}};
 			}
 		});
-		(void)r_inst;
+		(void)r12;
 
-		auto r_comp = bridge.register_function("studio_theme_qt", "compose_topbar", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r13 = bridge.register_function("studio_theme_qt", "compose_topbar", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				auto text = [&](std::size_t i) -> std::string {
@@ -784,9 +778,9 @@ public:
 				return {false};
 			}
 		});
-		(void)r_comp;
+		(void)r13;
 
-		auto r_preset = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r14 = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string names;
@@ -805,9 +799,9 @@ public:
 				return {false};
 			}
 		});
-		(void)r_preset;
+		(void)r14;
 
-		auto r_restyle = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r15 = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string css;
@@ -834,7 +828,7 @@ public:
 				return {false};
 			}
 		});
-		(void)r_restyle;
+		(void)r15;
 
 		m_registered = true;
 		m_log->info("bridge functions registered successfully");
@@ -1034,7 +1028,7 @@ private:
 
 					const int release_abi = parse_tag_abi(cand_tag);
 
-					// If we are built against a known ABI, reject releases explicitly targeted at a different ABI
+					// If built against an ABI, skip releases targeted at a different ABI
 					if (kBuiltAbi > 0 && release_abi > 0 && release_abi != kBuiltAbi)
 					{
 						pos = end_tag;
@@ -1237,17 +1231,22 @@ private:
 		{
 			return;
 		}
-		std::lock_guard lock(m_mutex);
-		if (!m_wanted)
+		std::string r_css, r_allow;
 		{
-			return;
+			std::lock_guard lock(m_mutex);
+			if (m_wanted && app->style_sheet().find(kSheetMarker) == std::string::npos)
+			{
+				m_log->info("Studio replaced its stylesheet; restoring theme");
+				apply_locked(m_css);
+			}
+			r_css = m_restyle_css;
+			r_allow = m_restyle_allow;
 		}
-		if (app->style_sheet().find(kSheetMarker) != std::string::npos)
+		// Periodically re-ensure menus and dynamic dropdowns keep their theme
+		if (!r_css.empty())
 		{
-			return;
+			restyle_widgets_now(r_css, r_allow);
 		}
-		m_log->info("Studio replaced its stylesheet; restoring theme");
-		apply_locked(m_css);
 	}
 
 	void send(const std::string& action)
@@ -1641,13 +1640,6 @@ private:
 		}
 	}
 
-	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
-	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
-	static constexpr std::string_view kDefaultAllow =
-	    "OutputWidgetRibbon\nOutputFilterTextEdit\nOutputFindSearchBar\nOutputRibbonCombinedFilterDropdown\n"
-	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
-	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu";
-
 	static std::string widget_style_sheet(rml::qt::QWidget* widget)
 	{
 #ifdef _WIN32
@@ -1703,10 +1695,10 @@ private:
 		});
 	}
 
-	void schedule_restyle(std::string css, std::string allow_text)
+	void restyle_widgets_now(const std::string& css, const std::string& allow_text)
 	{
 		auto alive = m_alive;
-		auto task = [this, alive, css = std::move(css), allow_text = std::move(allow_text)]() {
+		auto task = [this, alive, css, allow_text]() {
 			if (!alive->load())
 			{
 				return;
@@ -1735,27 +1727,35 @@ private:
 					{
 						continue;
 					}
-					const std::string own = widget_style_sheet(widget);
-					if (own.empty())
+					const char* cls = widget->class_name();
+					if (!cls || !*cls)
 					{
 						continue;
 					}
-					const char* cls = widget->class_name();
-					const bool allowed = !css.empty() && cls && allow.count(cls) > 0;
-					const std::string base = strip_ours(own);
+
+					std::string_view clsView(cls);
+					const bool isMenu = (clsView.find("Menu") != std::string_view::npos && clsView.find("MenuBar") == std::string_view::npos);
+					const bool allowed = !css.empty() && (allow.count(cls) > 0 || isMenu);
+
+					const std::string own = widget_style_sheet(widget);
+
 					if (!allowed)
 					{
-						if (base != own)
+						if (!own.empty())
 						{
-							widget->setStyleSheet(rml::qt::QString(base));
+							const std::string base = strip_ours(own);
+							if (base != own)
+							{
+								widget->setStyleSheet(rml::qt::QString(base));
+							}
 						}
 						continue;
 					}
-					if (blank(base))
-					{
-						continue;
-					}
-					const std::string want = base + std::string(kBegin) + css + std::string(kEnd);
+
+					// Ensure menus and dropdowns are themed directly even if they had no prior stylesheet
+					const std::string base = own.empty() ? "" : strip_ours(own);
+					const std::string want = base.empty() ? (std::string(kBegin) + css + std::string(kEnd))
+					                                      : (base + std::string(kBegin) + css + std::string(kEnd));
 					if (want != own)
 					{
 						widget->setStyleSheet(rml::qt::QString(want));
@@ -1775,6 +1775,16 @@ private:
 		{
 			task();
 		}
+	}
+
+	void schedule_restyle(std::string css, std::string allow_text)
+	{
+		{
+			std::lock_guard lock(m_mutex);
+			m_restyle_css = css;
+			m_restyle_allow = allow_text;
+		}
+		restyle_widgets_now(css, allow_text);
 	}
 
 	void schedule(std::string css)

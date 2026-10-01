@@ -91,7 +91,7 @@ namespace
 #ifndef STUDIO_THEME_VERSION
 // Default for local builds. Release/CI builds can define STUDIO_THEME_VERSION
 // (for example, from the Git tag) so the DLL version updates automatically.
-#define STUDIO_THEME_VERSION "1.1.2"
+#define STUDIO_THEME_VERSION "1.1.0"
 #endif
 
 constexpr const char* kHelperVersion = STUDIO_THEME_VERSION;

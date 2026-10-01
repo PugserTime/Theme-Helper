@@ -1,4 +1,4 @@
-// Studio Theme Qt helper  (1.1.0)
+// Studio Theme Qt helper
 //
 // Tiny native RML mod that lets the Studio Theme Luau scripts restyle the
 // parts of Studio that are native Qt (dock panel tabs + title bars, menu
@@ -11,9 +11,10 @@
 // and it's put back when the mod unloads. If Studio replaces its stylesheet
 // later (a Studio theme switch does), ours is put back on top within ~2s.
 //
-// 1.1.0 also carries the self-updater used by the editor's "update" banner:
+// It also carries the self-updater used by the editor's "update" banner:
 //
-//     version()                                  -> "1.1.0"
+//     version()                                  -> this build's version, e.g. "1.2.57"
+//     abi()                                      -> the RML_ABI_VERSION it was built for
 //     check_update(repo, assetName, jobId)       -> async, event studio_theme.update_check_done
 //     download_update(url, targetPath, jobId)    -> async, event studio_theme.update_download_done
 //     install_pending(targetPath)                -> swaps in a staged "<dll>.new" left by an update
@@ -48,10 +49,15 @@
 #include <RobloxModLoader/qt/qpainter.hpp>
 #include <RobloxModLoader/qt/qpixmap.hpp>
 #include <RobloxModLoader/qt/qrect.hpp>
+#include <RobloxModLoader/qt/qstring.hpp>
 #include <RobloxModLoader/qt/qobject.hpp>
 #include <RobloxModLoader/qt/qt_integration.hpp>
 #include <RobloxModLoader/qt/qwidget.hpp>
 #include <spdlog/spdlog.h>
+
+#if __has_include(<RobloxModLoader/version.hpp>)
+#include <RobloxModLoader/version.hpp>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -64,6 +70,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <variant>
 #include <mutex>
 #include <sstream>
@@ -77,7 +84,30 @@ using namespace rml::luau;
 
 namespace
 {
-constexpr const char* kHelperVersion = "1.1.1";
+// ---- Version numbers (automatic) -------------------------------------------
+// The version is  <BASE>.<BUILD>.  BASE ("major.minor") is the only part edited
+// by hand: bump it when the scripts start needing something new from the helper.
+// BUILD is filled in by the GitHub workflow (the repo's commit count), which
+// defines STUDIO_THEME_HELPER_VERSION on the command line of the build. The same
+// string becomes the release tag (v<version>-abi<N>), so what version() reports
+// always equals the release it came from. A local build without the workflow
+// reports <BASE>.0.
+// (The workflow reads the line below to find BASE: keep its format.)
+#ifndef STUDIO_THEME_HELPER_BASE
+#define STUDIO_THEME_HELPER_BASE "1.2"
+#endif
+#ifndef STUDIO_THEME_HELPER_VERSION
+#define STUDIO_THEME_HELPER_VERSION STUDIO_THEME_HELPER_BASE ".0"
+#endif
+constexpr const char* kHelperVersion = STUDIO_THEME_HELPER_VERSION;
+
+// The RML_ABI_VERSION this DLL was compiled against = the loader it can run on.
+// 0 if the RML headers don't expose it.
+#ifdef RML_ABI_VERSION
+constexpr int kBuiltAbi = RML_ABI_VERSION;
+#else
+constexpr int kBuiltAbi = 0;
+#endif
 constexpr const char* kSheetMarker = "/* studio_theme */";
 
 #ifdef _WIN32
@@ -572,6 +602,98 @@ public:
 			m_log->error("couldn't register ping: {}", pinged.error());
 		}
 
+		auto abied = bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs {
+			return {std::to_string(kBuiltAbi)};
+		});
+		if (!abied)
+		{
+			m_log->error("couldn't register abi: {}", abied.error());
+		}
+
+		// restyle_widgets(css, allowList): Studio attaches its OWN stylesheet to some
+		// widgets (the Output toolbar and filter, Studio's menus). A widget's own sheet
+		// beats the app-wide one, so those never took the theme or updated. This
+		// appends `css` to the own sheet of widgets whose class is in the allow list
+		// (one class per line; empty = the built-in list). Anything NOT on the list is
+		// never touched - Properties' editors carry own sheets too and must stay
+		// plain - and a block an older version left on one is removed.
+		auto restyled = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
+			std::string css;
+			std::string allow;
+			if (args.size() > 0)
+			{
+				if (const auto* text = std::get_if<std::string>(&args[0]))
+				{
+					css = *text;
+				}
+			}
+			if (args.size() > 1)
+			{
+				if (const auto* text = std::get_if<std::string>(&args[1]))
+				{
+					allow = *text;
+				}
+			}
+			schedule_restyle(std::move(css), std::move(allow));
+			return {true};
+		});
+		if (!restyled)
+		{
+			m_log->error("couldn't register restyle_widgets: {}", restyled.error());
+		}
+
+		// save_theme(path, text) / load_theme(path): the theme as a file in the mod
+		// folder, so the Studio half can apply it the moment Studio starts.
+		auto saved = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
+			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
+			const auto* text = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
+			if (!path || !text || path->empty())
+			{
+				return {std::string{"missing arguments"}};
+			}
+			namespace fs = std::filesystem;
+			const fs::path file = from_utf8(*path);
+			const fs::path temp = fs::path(file).concat(".tmp");
+			{
+				std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+				if (!out)
+				{
+					return {std::string{"couldn't write "} + *path};
+				}
+				out << *text;
+			}
+			std::error_code ec;
+			fs::rename(temp, file, ec); // atomic replace: never a half-written theme
+			if (ec)
+			{
+				return {"couldn't save theme: " + ec.message()};
+			}
+			return {true};
+		});
+		if (!saved)
+		{
+			m_log->error("couldn't register save_theme: {}", saved.error());
+		}
+
+		auto loaded = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
+			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
+			if (!path || path->empty())
+			{
+				return {std::string{}};
+			}
+			std::ifstream in(from_utf8(*path), std::ios::binary);
+			if (!in)
+			{
+				return {std::string{}};
+			}
+			std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+			return {text};
+		});
+		if (!loaded)
+		{
+			m_log->error("couldn't register load_theme: {}", loaded.error());
+		}
+
 		// ===== updater =====
 		auto versioned = bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs {
 			return {std::string{kHelperVersion}};
@@ -662,6 +784,7 @@ public:
 		{
 			auto& bridge = runtime->bridge();
 			for (const char* fn : {"apply", "scan", "pick_image", "install_image", "compose_topbar", "set_presets", "ping",
+			                       "abi", "restyle_widgets", "save_theme", "load_theme",
 			                       "version", "check_update", "download_update", "install_pending"})
 			{
 				auto removed = bridge.unregister_function("studio_theme_qt", fn);
@@ -1312,6 +1435,140 @@ private:
 				m_log->warn("couldn't emit picked_image_done: {}", emitted.error());
 			}
 			m_log->info("image picker: '{}' {}", result_path, error);
+		};
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
+	}
+
+	// ===== per-widget stylesheets (see restyle_widgets) =====
+	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
+	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
+
+	// Widgets whose own Studio sheet blocked the theme. Properties' editors are NOT here.
+	static constexpr std::string_view kDefaultAllow =
+	    "OutputWidgetRibbon\nOutputFilterTextEdit\nOutputFindSearchBar\nOutputRibbonCombinedFilterDropdown\n"
+	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
+	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu";
+
+	// QWidget::styleSheet() isn't wrapped by RML, so look it up in Qt directly.
+	// MSVC x64: a member returning a class by value takes (this, return slot).
+	static std::string widget_style_sheet(rml::qt::QWidget* widget)
+	{
+#ifdef _WIN32
+		using Getter = void* (*)(const void* self, void* ret);
+		static const Getter getter = []() -> Getter {
+			HMODULE module = GetModuleHandleW(L"Qt5Widgets.dll");
+			if (!module)
+			{
+				return nullptr;
+			}
+			return reinterpret_cast<Getter>(GetProcAddress(module, "?styleSheet@QWidget@@QEBA?AVQString@@XZ"));
+		}();
+		if (!getter || !widget)
+		{
+			return {};
+		}
+		rml::qt::QString result;
+		getter(widget, result.storage());
+		return result.to_utf8();
+#else
+		(void)widget;
+		return {};
+#endif
+	}
+
+	static std::string strip_ours(const std::string& sheet)
+	{
+		const auto begin = sheet.find(kBegin);
+		if (begin == std::string::npos)
+		{
+			return sheet;
+		}
+		const auto end = sheet.find(kEnd, begin);
+		if (end == std::string::npos)
+		{
+			return sheet.substr(0, begin);
+		}
+		return sheet.substr(0, begin) + sheet.substr(end + kEnd.size());
+	}
+
+	static bool blank(const std::string& text)
+	{
+		return std::all_of(text.begin(), text.end(), [](char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; });
+	}
+
+	void schedule_restyle(std::string css, std::string allow_text)
+	{
+		auto alive = m_alive;
+		auto task = [this, alive, css = std::move(css), allow_text = std::move(allow_text)]() {
+			if (!alive->load())
+			{
+				return;
+			}
+			std::set<std::string> allow;
+			{
+				std::istringstream lines(allow_text.empty() ? std::string(kDefaultAllow) : allow_text);
+				std::string line;
+				while (std::getline(lines, line))
+				{
+					if (!line.empty() && line.back() == '\r')
+					{
+						line.pop_back();
+					}
+					if (!line.empty())
+					{
+						allow.insert(line);
+					}
+				}
+			}
+			int changed = 0;
+			for (auto* widget : rml::qt::QApplication::all_widgets())
+			{
+				if (!widget)
+				{
+					continue;
+				}
+				const std::string own = widget_style_sheet(widget);
+				if (own.empty())
+				{
+					continue; // no own sheet: the app-wide stylesheet already reaches it
+				}
+				const char* cls = widget->class_name();
+				const bool allowed = !css.empty() && cls && allow.count(cls) > 0;
+				const std::string base = strip_ours(own);
+				if (!allowed)
+				{
+					// not ours to touch - this also removes a block an older version left here
+					if (base != own)
+					{
+						const rml::qt::QString sheet(base);
+						widget->setStyleSheet(sheet);
+						++changed;
+					}
+					continue;
+				}
+				if (blank(base))
+				{
+					continue; // Studio cleared its sheet: nothing to append to
+				}
+				const std::string want = base + std::string(kBegin) + css + std::string(kEnd);
+				if (want != own)
+				{
+					const rml::qt::QString sheet(want);
+					widget->setStyleSheet(sheet);
+					++changed;
+				}
+			}
+			if (changed > 0)
+			{
+				m_log->info("restyled {} widget(s) that have their own stylesheet", changed);
+			}
 		};
 		if (auto* qt = rml::qt::QtIntegration::instance())
 		{

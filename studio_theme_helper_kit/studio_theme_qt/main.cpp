@@ -995,8 +995,7 @@ private:
 				m_last_presets = names;
 				auto& menu = qt->menu();
 				for (const auto id : m_preset_items) {
-					auto rem = menu.remove(id);
-					(void)rem;
+					menu.remove(id);
 				}
 				m_preset_items.clear();
 				std::istringstream lines(names);

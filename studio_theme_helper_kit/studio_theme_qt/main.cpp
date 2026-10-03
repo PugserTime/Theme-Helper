@@ -1,10 +1,8 @@
 // Studio Theme Qt helper
 //
 // Native RML mod for styling Qt components and handling self-updates.
-
-#if defined(_MSC_VER)
-#pragma warning(disable: 4834)
-#endif
+// Designed with isolated subsystems so the updater and bridge remain fully
+// functional even if Qt integration or Studio styling encounters errors.
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -52,6 +50,7 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -80,7 +79,7 @@ constexpr int kBuiltAbi = RML_ABI_VERSION;
 constexpr int kBuiltAbi = 0;
 #endif
 
-constexpr const char* kSheetMarker = "/* studio_theme */";
+constexpr std::string_view kSheetMarker = "/* studio_theme */";
 
 #ifdef _WIN32
 std::filesystem::path self_module_path()
@@ -186,6 +185,16 @@ bool http_get(const std::string& url, std::string& body, int& status, std::size_
 	{
 		status = static_cast<int>(code);
 	}
+	{
+		DWORD length = 0;
+		DWORD length_size = sizeof(length);
+		if (WinHttpQueryHeaders(request.h, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+		                        WINHTTP_HEADER_NAME_BY_INDEX, &length, &length_size, WINHTTP_NO_HEADER_INDEX) &&
+		    length > 0 && length <= max_bytes)
+		{
+			body.reserve(length);
+		}
+	}
 	for (;;)
 	{
 		DWORD available = 0;
@@ -203,18 +212,20 @@ bool http_get(const std::string& url, std::string& body, int& status, std::size_
 			error = "download size exceeded safety limit";
 			return false;
 		}
-		std::string chunk(available, '\0');
+		const std::size_t old_size = body.size();
+		body.resize(old_size + available);
 		DWORD read = 0;
-		if (!WinHttpReadData(request.h, chunk.data(), available, &read))
+		if (!WinHttpReadData(request.h, body.data() + old_size, available, &read))
 		{
 			error = std::format("download read failed (error {})", GetLastError());
 			return false;
 		}
-		body.append(chunk.data(), read);
+		body.resize(old_size + read);
 	}
 	return true;
 }
 
+// Plain helper without local C++ objects to prevent C2712 __try object unwinding error
 static bool safe_invoke_getter(void* getter_fn, const void* self, void* ret_storage)
 {
 	__try
@@ -396,6 +407,12 @@ bool contains_any(std::string_view text, std::initializer_list<std::string_view>
 	return false;
 }
 
+// Input-like widgets: line edits, combo boxes, spin boxes and Studio's own
+// filter/search boxes (whose exact class names aren't known in advance, e.g. the
+// Properties filter). They often carry their own stylesheet, which Qt prefers over
+// the application-wide one, so they are restyled directly with a small color-only
+// sheet. Anything that looks like a button, menu, dropdown group or ribbon piece is
+// NOT an input, and Properties' value editors (not filter/search boxes) stay plain.
 bool looks_like_input(std::string_view cls)
 {
 	if (contains_any(cls, {"Ribbon", "Button", "Menu", "Dropdown", "Group", "Label", "Tab", "ScriptEditor", "CodeEdit"}))
@@ -432,16 +449,22 @@ int parse_tag_abi(const std::string& tag)
 
 } // namespace
 
+struct RestyleSpec
+{
+	std::string css_block;
+	std::string leaf_block;
+	bool has_css = false;
+	bool has_leaf = false;
+	std::set<std::string, std::less<>> allow;
+};
+
 class studio_theme_qt final : public ModBase
 {
 	std::shared_ptr<spdlog::logger> m_log;
 	std::mutex m_mutex;
 	std::string m_original;
-	std::string m_last;
 	std::string m_css;
-	std::string m_restyle_css;
-	std::string m_restyle_allow;
-	std::string m_restyle_leaf;
+	std::shared_ptr<const RestyleSpec> m_restyle;
 	bool m_wanted = false;
 	bool m_captured = false;
 	std::mutex m_register_mutex;
@@ -452,7 +475,8 @@ class studio_theme_qt final : public ModBase
 	uint64_t m_menu_root = 0;
 	uint64_t m_menu_presets = 0;
 	std::vector<uint64_t> m_preset_items;
-	std::string m_last_presets;
+	std::size_t m_last_presets_hash = 0;
+	bool m_have_presets = false;
 	int m_compose_counter = 0;
 	std::string m_last_compose;
 
@@ -463,7 +487,7 @@ class studio_theme_qt final : public ModBase
 	    "OutputRibbonContextFilterDropdown\nOutputRibbonFilterDropdownGroup\nOutputRibbonMessageTypeFilterDropdown\n"
 	    "OutputRibbonMoreDropdown\nRBX::Studio::detail::Menu\nQMenu\nQtitan::RibbonMenu\nQtitan::Menu\n"
 	    "RBX::Studio::LogOutMenu\nQStatusBar\nRBX::Studio::CommandBarButton\nRBX::Studio::CommandBarButtonContainer\n"
-	    "RBX::Studio::CommandBarHistoryListWidget\nRBX::Studio::TopBar";
+	    "RBX::Studio::CommandBarHistoryListWidget";
 
 public:
 	studio_theme_qt()
@@ -479,14 +503,48 @@ public:
 	{
 		m_log->info("loaded {}", kHelperVersion);
 
-		try { install_pending_update(); } catch (...) {}
+		try
+		{
+			install_pending_update();
+		}
+		catch (const std::exception& e)
+		{
+			m_log->warn("install_pending_update failed: {}", e.what());
+		}
+		catch (...)
+		{
+		}
 
+		// Register bridge first so updater functions are available immediately
 		bool reg_ok = false;
-		try { reg_ok = register_bridge(); } catch (...) {}
-		try { build_menu(); } catch (...) {}
-		try { start_watchdog(); } catch (...) {}
+		try
+		{
+			reg_ok = register_bridge();
+		}
+		catch (...)
+		{
+		}
 
-		if (reg_ok) return;
+		try
+		{
+			build_menu();
+		}
+		catch (...)
+		{
+		}
+
+		try
+		{
+			start_watchdog();
+		}
+		catch (...)
+		{
+		}
+
+		if (reg_ok)
+		{
+			return;
+		}
 
 		m_stop = false;
 		std::thread([this]() {
@@ -495,9 +553,18 @@ public:
 				std::this_thread::sleep_for(std::chrono::milliseconds(500));
 				try
 				{
-					if (register_bridge()) return;
+					if (register_bridge())
+					{
+						return;
+					}
 				}
-				catch (...) {}
+				catch (...)
+				{
+				}
+			}
+			if (!m_stop)
+			{
+				m_log->error("gave up waiting for script runtime");
 			}
 		}).detach();
 	}
@@ -510,22 +577,41 @@ public:
 	bool register_bridge()
 	{
 		std::lock_guard guard(m_register_mutex);
-		if (m_registered) return true;
+		if (m_registered)
+		{
+			return true;
+		}
 		auto* runtime = script_runtime();
-		if (!runtime) return false;
+		if (!runtime)
+		{
+			return false;
+		}
 		auto& bridge = runtime->bridge();
 
-		auto r1 = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs { return {true}; });
+		// Core & updater functions (zero Qt dependencies)
+		auto r1 = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
+			return {true};
+		});
 		(void)r1;
-		auto r2 = bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs { return {std::string{kHelperVersion}}; });
+
+		auto r2 = bridge.register_function("studio_theme_qt", "version", [](const BridgeArgs&) -> BridgeArgs {
+			return {std::string{kHelperVersion}};
+		});
 		(void)r2;
-		auto r3 = bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs { return {std::to_string(kBuiltAbi)}; });
+
+		auto r3 = bridge.register_function("studio_theme_qt", "abi", [](const BridgeArgs&) -> BridgeArgs {
+			return {std::to_string(kBuiltAbi)};
+		});
 		(void)r3;
 
 		auto r4 = bridge.register_function("studio_theme_qt", "check_update", [this](const BridgeArgs& args) -> BridgeArgs {
 			auto text = [&](std::size_t i) -> std::string {
-				if (i < args.size()) {
-					if (const auto* v = std::get_if<std::string>(&args[i])) return *v;
+				if (i < args.size())
+				{
+					if (const auto* v = std::get_if<std::string>(&args[i]))
+					{
+						return *v;
+					}
 				}
 				return {};
 			};
@@ -536,8 +622,12 @@ public:
 
 		auto r5 = bridge.register_function("studio_theme_qt", "download_update", [this](const BridgeArgs& args) -> BridgeArgs {
 			auto text = [&](std::size_t i) -> std::string {
-				if (i < args.size()) {
-					if (const auto* v = std::get_if<std::string>(&args[i])) return *v;
+				if (i < args.size())
+				{
+					if (const auto* v = std::get_if<std::string>(&args[i]))
+					{
+						return *v;
+					}
 				}
 				return {};
 			};
@@ -548,7 +638,10 @@ public:
 
 		auto r6 = bridge.register_function("studio_theme_qt", "install_pending", [this](const BridgeArgs& args) -> BridgeArgs {
 			const auto* target = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
-			if (!target || target->empty()) return {std::string{"error"}, std::string{"missing path"}};
+			if (!target || target->empty())
+			{
+				return {std::string{"error"}, std::string{"missing path"}};
+			}
 			try
 			{
 				namespace fs = std::filesystem;
@@ -556,20 +649,33 @@ public:
 				fs::path staged = dll;
 				staged += ".new";
 				std::error_code ec;
-				if (!fs::exists(staged, ec)) return {std::string{"none"}, std::string{}};
+				if (!fs::exists(staged, ec))
+				{
+					return {std::string{"none"}, std::string{}};
+				}
 				std::string how;
 				const bool ok = swap_in(dll, staged, how);
+				m_log->info("pending update at {}: {}", *target, how);
 				return {std::string{ok ? how : "error"}, ok ? std::string{} : how};
 			}
-			catch (const std::exception& e) { return {std::string{"error"}, std::string{e.what()}}; }
-			catch (...) { return {std::string{"error"}, std::string{"unknown swap error"}}; }
+			catch (const std::exception& e)
+			{
+				return {std::string{"error"}, std::string{e.what()}};
+			}
+			catch (...)
+			{
+				return {std::string{"error"}, std::string{"unknown swap error"}};
+			}
 		});
 		(void)r6;
 
 		auto r7 = bridge.register_function("studio_theme_qt", "save_theme", [](const BridgeArgs& args) -> BridgeArgs {
 			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 			const auto* text = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
-			if (!path || !text || path->empty()) return {std::string{"missing arguments"}};
+			if (!path || !text || path->empty())
+			{
+				return {std::string{"missing arguments"}};
+			}
 			try
 			{
 				namespace fs = std::filesystem;
@@ -577,48 +683,94 @@ public:
 				const fs::path temp = fs::path(file).concat(".tmp");
 				{
 					std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-					if (!out) return {std::string{"couldn't write "} + *path};
+					if (!out)
+					{
+						return {std::string{"couldn't write "} + *path};
+					}
 					out << *text;
 				}
 				std::error_code ec;
 				fs::rename(temp, file, ec);
-				if (ec) return {"couldn't save theme: " + ec.message()};
+				if (ec)
+				{
+					return {"couldn't save theme: " + ec.message()};
+				}
 				return {true};
 			}
-			catch (const std::exception& e) { return {std::string{e.what()}}; }
-			catch (...) { return {std::string{"save failed"}}; }
+			catch (const std::exception& e)
+			{
+				return {std::string{e.what()}};
+			}
+			catch (...)
+			{
+				return {std::string{"save failed"}};
+			}
 		});
 		(void)r7;
 
 		auto r8 = bridge.register_function("studio_theme_qt", "load_theme", [](const BridgeArgs& args) -> BridgeArgs {
 			const auto* path = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
-			if (!path || path->empty()) return {std::string{}};
+			if (!path || path->empty())
+			{
+				return {std::string{}};
+			}
 			try
 			{
-				std::ifstream in(from_utf8(*path), std::ios::binary);
-				if (!in) return {std::string{}};
-				return {std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>())};
+				std::ifstream in(from_utf8(*path), std::ios::binary | std::ios::ate);
+				if (!in)
+				{
+					return {std::string{}};
+				}
+				const auto size = static_cast<std::streamoff>(in.tellg());
+				if (size <= 0)
+				{
+					return {std::string{}};
+				}
+				std::string text(static_cast<std::size_t>(size), '\0');
+				in.seekg(0);
+				in.read(text.data(), size);
+				text.resize(static_cast<std::size_t>(in.gcount()));
+				return {std::move(text)};
 			}
-			catch (...) { return {std::string{}}; }
+			catch (...)
+			{
+				return {std::string{}};
+			}
 		});
 		(void)r8;
 
+		// Qt styling functions
 		auto r9 = bridge.register_function("studio_theme_qt", "apply", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
 				std::string css;
-				if (!args.empty()) {
-					if (const auto* text = std::get_if<std::string>(&args[0])) css = *text;
+				if (!args.empty())
+				{
+					if (const auto* text = std::get_if<std::string>(&args[0]))
+					{
+						css = *text;
+					}
 				}
 				schedule(std::move(css));
 				return {true};
 			}
-			catch (...) { return {false}; }
+			catch (...)
+			{
+				return {false};
+			}
 		});
 		(void)r9;
 
 		auto r10 = bridge.register_function("studio_theme_qt", "scan", [this](const BridgeArgs&) -> BridgeArgs {
-			try { schedule_scan(); return {true}; } catch (...) { return {false}; }
+			try
+			{
+				schedule_scan();
+				return {true};
+			}
+			catch (...)
+			{
+				return {false};
+			}
 		});
 		(void)r10;
 
@@ -626,13 +778,20 @@ public:
 			try
 			{
 				std::string dir;
-				if (!args.empty()) {
-					if (const auto* text = std::get_if<std::string>(&args[0])) dir = *text;
+				if (!args.empty())
+				{
+					if (const auto* text = std::get_if<std::string>(&args[0]))
+					{
+						dir = *text;
+					}
 				}
 				schedule_pick(std::move(dir));
 				return {true};
 			}
-			catch (...) { return {false}; }
+			catch (...)
+			{
+				return {false};
+			}
 		});
 		(void)r11;
 
@@ -641,10 +800,16 @@ public:
 			{
 				const auto* src = args.size() > 0 ? std::get_if<std::string>(&args[0]) : nullptr;
 				const auto* content = args.size() > 1 ? std::get_if<std::string>(&args[1]) : nullptr;
-				if (!src || !content || src->empty() || content->empty()) return {std::string{}, std::string{"missing arguments"}};
+				if (!src || !content || src->empty() || content->empty())
+				{
+					return {std::string{}, std::string{"missing arguments"}};
+				}
 				return install_image(*src, *content);
 			}
-			catch (...) { return {std::string{}, std::string{"install_image exception"}}; }
+			catch (...)
+			{
+				return {std::string{}, std::string{"install_image exception"}};
+			}
 		});
 		(void)r12;
 
@@ -652,19 +817,30 @@ public:
 			try
 			{
 				auto text = [&](std::size_t i) -> std::string {
-					if (i < args.size()) {
-						if (const auto* v = std::get_if<std::string>(&args[i])) return *v;
+					if (i < args.size())
+					{
+						if (const auto* v = std::get_if<std::string>(&args[i]))
+						{
+							return *v;
+						}
 					}
 					return {};
 				};
 				double opacity = 1.0;
-				if (args.size() > 2) {
-					if (const auto* d = std::get_if<double>(&args[2])) opacity = *d;
+				if (args.size() > 2)
+				{
+					if (const auto* d = std::get_if<double>(&args[2]))
+					{
+						opacity = *d;
+					}
 				}
 				schedule_compose(text(0), text(1), opacity, text(3), text(4), text(5));
 				return {true};
 			}
-			catch (...) { return {false}; }
+			catch (...)
+			{
+				return {false};
+			}
 		});
 		(void)r13;
 
@@ -672,31 +848,62 @@ public:
 			try
 			{
 				std::string names;
-				if (!args.empty()) {
-					if (const auto* text = std::get_if<std::string>(&args[0])) names = *text;
+				if (!args.empty())
+				{
+					if (const auto* text = std::get_if<std::string>(&args[0]))
+					{
+						names = *text;
+					}
 				}
 				schedule_presets(std::move(names));
 				return {true};
 			}
-			catch (...) { return {false}; }
+			catch (...)
+			{
+				return {false};
+			}
 		});
 		(void)r14;
 
 		auto r15 = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
-				std::string css, allow, leaf;
-				if (args.size() > 0) { if (const auto* t = std::get_if<std::string>(&args[0])) css = *t; }
-				if (args.size() > 1) { if (const auto* t = std::get_if<std::string>(&args[1])) allow = *t; }
-				if (args.size() > 2) { if (const auto* t = std::get_if<std::string>(&args[2])) leaf = *t; }
+				std::string css;
+				std::string allow;
+				std::string leaf;
+				if (args.size() > 0)
+				{
+					if (const auto* text = std::get_if<std::string>(&args[0]))
+					{
+						css = *text;
+					}
+				}
+				if (args.size() > 1)
+				{
+					if (const auto* text = std::get_if<std::string>(&args[1]))
+					{
+						allow = *text;
+					}
+				}
+				if (args.size() > 2)
+				{
+					if (const auto* text = std::get_if<std::string>(&args[2]))
+					{
+						leaf = *text;
+					}
+				}
 				schedule_restyle(std::move(css), std::move(allow), std::move(leaf));
 				return {true};
 			}
-			catch (...) { return {false}; }
+			catch (...)
+			{
+				return {false};
+			}
 		});
 		(void)r15;
 
 		m_registered = true;
+		m_log->info("bridge functions registered successfully");
 		return true;
 	}
 
@@ -713,7 +920,9 @@ public:
 				m_menu_root = 0;
 			}
 		}
-		catch (...) {}
+		catch (...)
+		{
+		}
 
 		try
 		{
@@ -729,11 +938,15 @@ public:
 						auto res = bridge.unregister_function("studio_theme_qt", fn);
 						(void)res;
 					}
-					catch (...) {}
+					catch (...)
+					{
+					}
 				}
 			}
 		}
-		catch (...) {}
+		catch (...)
+		{
+		}
 
 		for (int waited = 0; m_jobs.load() > 0 && waited < 200; ++waited)
 		{
@@ -751,7 +964,11 @@ public:
 				}
 			}
 		}
-		catch (...) {}
+		catch (...)
+		{
+		}
+
+		m_log->info("unloaded cleanly");
 	}
 
 private:
@@ -759,13 +976,20 @@ private:
 	{
 #ifdef _WIN32
 		const auto self = self_module_path();
-		if (self.empty()) return;
+		if (self.empty())
+		{
+			return;
+		}
 		auto staged = self;
 		staged += ".new";
 		std::error_code ec;
-		if (!std::filesystem::exists(staged, ec)) return;
+		if (!std::filesystem::exists(staged, ec))
+		{
+			return;
+		}
 		std::string how;
 		swap_in(self, staged, how);
+		m_log->info("staged update next to running helper: {}", how);
 #endif
 	}
 
@@ -773,7 +997,13 @@ private:
 	{
 		++m_jobs;
 		std::thread([this, fn = std::move(fn)]() {
-			try { fn(); } catch (...) {}
+			try
+			{
+				fn();
+			}
+			catch (...)
+			{
+			}
 			--m_jobs;
 		}).detach();
 	}
@@ -782,32 +1012,51 @@ private:
 	{
 		auto alive = m_alive;
 		auto task = [this, alive, key, event, json = std::move(json)]() {
-			if (!alive->load()) return;
+			if (!alive->load())
+			{
+				return;
+			}
 			try
 			{
 				auto* runtime = script_runtime();
-				if (!runtime) return;
+				if (!runtime)
+				{
+					return;
+				}
 				auto& bridge = runtime->bridge();
-				auto s1 = bridge.set_shared(key, json);
-				(void)s1;
-				auto s2 = bridge.emit(event, BridgeArgs{std::string{"ok"}});
-				(void)s2;
+				auto stored = bridge.set_shared(key, json);
+				(void)stored;
+				auto emitted = bridge.emit(event, BridgeArgs{std::string{"ok"}});
+				(void)emitted;
 			}
-			catch (...) {}
+			catch (...)
+			{
+			}
 		};
 
 		try
 		{
-			if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-			else task();
+			if (auto* qt = rml::qt::QtIntegration::instance())
+			{
+				qt->run_on_gui_thread(task);
+			}
+			else
+			{
+				task();
+			}
 		}
-		catch (...) { task(); }
+		catch (...)
+		{
+			task();
+		}
 	}
 
 	void start_check(std::string repo, std::string asset, std::string job)
 	{
 		spawn_job([this, repo = std::move(repo), asset = std::move(asset), job = std::move(job)]() {
-			std::string tag, url, error;
+			std::string tag;
+			std::string url;
+			std::string error;
 			const std::string base = "https://api.github.com/repos/" + repo + "/releases";
 			bool reached = false;
 
@@ -816,47 +1065,114 @@ private:
 				std::string body;
 				int status = 0;
 				std::string http_error;
-				if (!http_get(feed, body, status, 4 * 1024 * 1024, http_error)) { error = http_error; break; }
+				if (!http_get(feed, body, status, 4 * 1024 * 1024, http_error))
+				{
+					error = http_error;
+					break;
+				}
 				reached = true;
-				if (status == 404) { error = "no releases found for " + repo; continue; }
-				if (status == 403 || status == 429) { error = "GitHub rate-limited request, try again later"; break; }
-				if (status != 200) { error = std::format("GitHub returned HTTP {}", status); break; }
+				if (status == 404)
+				{
+					error = "no releases found for " + repo;
+					continue;
+				}
+				if (status == 403 || status == 429)
+				{
+					error = "GitHub rate-limited request, try again in a few minutes";
+					break;
+				}
+				if (status != 200)
+				{
+					error = std::format("GitHub returned HTTP {}", status);
+					break;
+				}
 
 				std::size_t pos = 0;
 				while ((pos = body.find("\"tag_name\"", pos)) != std::string::npos)
 				{
 					std::size_t end_tag = 0;
 					std::string cand_tag = json_string_after(body, "tag_name", pos, &end_tag);
-					if (cand_tag.empty()) { pos += 10; continue; }
+					if (cand_tag.empty())
+					{
+						pos += 10;
+						continue;
+					}
+
 					const int release_abi = parse_tag_abi(cand_tag);
-					if (kBuiltAbi > 0 && release_abi > 0 && release_abi != kBuiltAbi) { pos = end_tag; continue; }
+
+					// If built against an ABI, skip releases targeted at a different ABI
+					if (kBuiltAbi > 0 && release_abi > 0 && release_abi != kBuiltAbi)
+					{
+						pos = end_tag;
+						continue;
+					}
 
 					const std::size_t next_release_pos = body.find("\"tag_name\"", end_tag);
 					const std::size_t search_limit = (next_release_pos == std::string::npos) ? body.size() : next_release_pos;
-					std::string best_url, fallback_url;
-					std::size_t url_pos = end_tag;
 
+					std::string best_url;
+					std::string fallback_url;
+
+					std::size_t url_pos = end_tag;
 					while (url_pos < search_limit)
 					{
 						std::size_t end_url = 0;
 						std::string cand_url = json_string_after(body, "browser_download_url", url_pos, &end_url);
-						if (cand_url.empty() || end_url >= search_limit) break;
+						if (cand_url.empty() || end_url >= search_limit)
+						{
+							break;
+						}
 						url_pos = end_url;
-						if (!asset.empty() && ends_with(cand_url, "/" + asset)) { best_url = cand_url; break; }
-						if (kBuiltAbi > 0 && ends_with(cand_url, std::format("_abi{}.dll", kBuiltAbi))) { best_url = cand_url; break; }
-						if (ends_with(cand_url, "/studio_theme_qt.dll")) fallback_url = cand_url;
+
+						if (!asset.empty() && ends_with(cand_url, "/" + asset))
+						{
+							best_url = cand_url;
+							break;
+						}
+						if (kBuiltAbi > 0 && ends_with(cand_url, std::format("_abi{}.dll", kBuiltAbi)))
+						{
+							best_url = cand_url;
+							break;
+						}
+						if (ends_with(cand_url, "/studio_theme_qt.dll"))
+						{
+							fallback_url = cand_url;
+						}
 					}
 
-					if (!best_url.empty()) { url = best_url; tag = cand_tag; break; }
-					if (!fallback_url.empty()) { url = fallback_url; tag = cand_tag; break; }
+					if (!best_url.empty())
+					{
+						url = best_url;
+						tag = cand_tag;
+						break;
+					}
+					if (!fallback_url.empty())
+					{
+						url = fallback_url;
+						tag = cand_tag;
+						break;
+					}
+
 					pos = search_limit;
 				}
-				if (!url.empty()) { error.clear(); break; }
+
+				if (!url.empty())
+				{
+					error.clear();
+					break;
+				}
+				error = "no compatible DLL found in newest releases";
 			}
-			if (!reached && error.empty()) error = "couldn't reach GitHub";
+
+			if (!reached && error.empty())
+			{
+				error = "couldn't reach GitHub";
+			}
+
 			publish("studio_theme.update_check", "studio_theme.update_check_done",
 			        std::format("{{\"job\":\"{}\",\"tag\":\"{}\",\"url\":\"{}\",\"error\":\"{}\"}}",
 			                    json_escape(job), json_escape(tag), json_escape(url), json_escape(error)));
+			m_log->info("update check {}: tag '{}' {}", repo, tag, error);
 		});
 	}
 
@@ -864,16 +1180,32 @@ private:
 	{
 		spawn_job([this, url = std::move(url), target = std::move(target), job = std::move(job)]() {
 			bool ok = false;
-			std::string how, error;
+			std::string how;
+			std::string error;
 			std::size_t size = 0;
 			do
 			{
-				if (url.empty() || target.empty()) { error = "missing url or target path"; break; }
+				if (url.empty() || target.empty())
+				{
+					error = "missing url or target path";
+					break;
+				}
 				std::string body;
 				int status = 0;
-				if (!http_get(url, body, status, 64u * 1024u * 1024u, error)) break;
-				if (status != 200) { error = std::format("download failed: HTTP {}", status); break; }
-				if (!looks_like_helper_dll(body, error)) { error = "refusing to install: " + error; break; }
+				if (!http_get(url, body, status, 64u * 1024u * 1024u, error))
+				{
+					break;
+				}
+				if (status != 200)
+				{
+					error = std::format("download failed: HTTP {}", status);
+					break;
+				}
+				if (!looks_like_helper_dll(body, error))
+				{
+					error = "refusing to install: " + error;
+					break;
+				}
 				size = body.size();
 				try
 				{
@@ -885,20 +1217,42 @@ private:
 					staged += ".new";
 					{
 						std::ofstream out(staged, std::ios::binary | std::ios::trunc);
-						if (!out) { error = "couldn't write " + utf8(staged); break; }
+						if (!out)
+						{
+							error = "couldn't write " + utf8(staged);
+							break;
+						}
 						out.write(body.data(), static_cast<std::streamsize>(body.size()));
+						out.close();
+						if (!out)
+						{
+							error = "writing " + utf8(staged) + " failed (disk full?)";
+							break;
+						}
 					}
 					ok = swap_in(dll, staged, how);
-					if (!ok) error = how;
+					if (!ok)
+					{
+						error = how;
+					}
 				}
-				catch (const std::exception& e) { error = e.what(); ok = false; }
-				catch (...) { error = "unknown filesystem exception"; ok = false; }
+				catch (const std::exception& e)
+				{
+					error = e.what();
+					ok = false;
+				}
+				catch (...)
+				{
+					error = "unknown filesystem exception during download swap";
+					ok = false;
+				}
 			} while (false);
 
 			publish("studio_theme.update_download", "studio_theme.update_download_done",
 			        std::format("{{\"job\":\"{}\",\"ok\":{},\"how\":\"{}\",\"bytes\":{},\"error\":\"{}\"}}",
 			                    json_escape(job), ok ? "true" : "false", json_escape(ok ? how : std::string{}),
 			                    size, json_escape(error)));
+			m_log->info("update download: ok={} {} {} bytes {}", ok, how, size, error);
 		});
 	}
 
@@ -911,16 +1265,33 @@ private:
 				{
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				}
-				if (!alive->load() || m_stop) return;
+				if (!alive->load() || m_stop)
+				{
+					return;
+				}
 				auto task = [this, alive]() {
-					if (!alive->load()) return;
-					try { reassert(); } catch (...) {}
+					if (!alive->load())
+					{
+						return;
+					}
+					try
+					{
+						reassert();
+					}
+					catch (...)
+					{
+					}
 				};
 				try
 				{
-					if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
+					if (auto* qt = rml::qt::QtIntegration::instance())
+					{
+						qt->run_on_gui_thread(task);
+					}
 				}
-				catch (...) {}
+				catch (...)
+				{
+				}
 			}
 		}).detach();
 	}
@@ -928,28 +1299,34 @@ private:
 	void reassert()
 	{
 		auto* app = rml::qt::QApplication::instance();
-		if (!app) return;
-		std::string r_css, r_allow, r_leaf;
+		if (!app)
+		{
+			return;
+		}
+		std::shared_ptr<const RestyleSpec> spec;
 		{
 			std::lock_guard lock(m_mutex);
 			if (m_wanted && app->style_sheet().find(kSheetMarker) == std::string::npos)
 			{
+				m_log->info("Studio replaced its stylesheet; restoring theme");
 				apply_locked(m_css);
 			}
-			r_css = m_restyle_css;
-			r_allow = m_restyle_allow;
-			r_leaf = m_restyle_leaf;
+			spec = m_restyle;
 		}
-		if (!r_css.empty())
+		// Periodically re-ensure menus and dynamic dropdowns keep their theme
+		if (spec && spec->has_css)
 		{
-			restyle_widgets_now(r_css, r_allow, r_leaf);
+			restyle_widgets_now(std::move(spec));
 		}
 	}
 
 	void send(const std::string& action)
 	{
 		auto* runtime = script_runtime();
-		if (!runtime) return;
+		if (!runtime)
+		{
+			return;
+		}
 		auto res = runtime->bridge().emit("studio_theme.menu", BridgeArgs{action});
 		(void)res;
 	}
@@ -957,10 +1334,16 @@ private:
 	void build_menu()
 	{
 		auto* qt = rml::qt::QtIntegration::instance();
-		if (!qt) return;
+		if (!qt)
+		{
+			return;
+		}
 		auto& menu = qt->menu();
 		m_menu_root = menu.add_submenu(0, "Studio Theme");
-		if (m_menu_root == 0) return;
+		if (m_menu_root == 0)
+		{
+			return;
+		}
 		auto a1 = menu.add_action(m_menu_root, "Open / close Theme Editor", [this]() { send("open"); });
 		(void)a1;
 		auto a2 = menu.add_action(m_menu_root, "Turn theme on / off", [this]() { send("toggle"); });
@@ -991,10 +1374,20 @@ private:
 			try
 			{
 				auto* qt = rml::qt::QtIntegration::instance();
-				if (!qt || m_menu_presets == 0 || names == m_last_presets) return;
-				m_last_presets = names;
+				if (!qt || m_menu_presets == 0)
+				{
+					return;
+				}
+				const std::size_t digest = std::hash<std::string>{}(names);
+				if (m_have_presets && digest == m_last_presets_hash)
+				{
+					return;
+				}
+				m_have_presets = true;
+				m_last_presets_hash = digest;
 				auto& menu = qt->menu();
-				for (const auto id : m_preset_items) {
+				for (const auto id : m_preset_items)
+				{
 					menu.remove(id);
 				}
 				m_preset_items.clear();
@@ -1002,16 +1395,30 @@ private:
 				std::string name;
 				while (std::getline(lines, name))
 				{
-					if (!name.empty() && name.back() == '\r') name.pop_back();
-					if (name.empty()) continue;
+					if (!name.empty() && name.back() == '\r')
+					{
+						name.pop_back();
+					}
+					if (name.empty())
+					{
+						continue;
+					}
 					m_preset_items.push_back(menu.add_action(m_menu_presets, name, [this, name]() { send("preset:" + name); }));
 				}
 			}
-			catch (...) {}
+			catch (...)
+			{
+			}
 		};
 
-		if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-		else task();
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
 	}
 
 	void schedule_scan()
@@ -1022,9 +1429,15 @@ private:
 				std::map<std::string, int> counts;
 				for (auto* widget : rml::qt::QApplication::all_widgets())
 				{
-					if (!widget) continue;
+					if (!widget)
+					{
+						continue;
+					}
 					const char* cls = widget->class_name();
-					if (cls && *cls) ++counts[cls];
+					if (cls && *cls)
+					{
+						++counts[cls];
+					}
 				}
 				std::string json = "[";
 				bool first = true;
@@ -1035,18 +1448,29 @@ private:
 				}
 				json += "]";
 				auto* runtime = script_runtime();
-				if (!runtime) return;
+				if (!runtime)
+				{
+					return;
+				}
 				auto& bridge = runtime->bridge();
-				auto s1 = bridge.set_shared("studio_theme.qt_scan", json);
-				(void)s1;
-				auto s2 = bridge.emit("studio_theme.qt_scan_done", BridgeArgs{std::string{"ok"}});
-				(void)s2;
+				auto stored = bridge.set_shared("studio_theme.qt_scan", json);
+				(void)stored;
+				auto emitted = bridge.emit("studio_theme.qt_scan_done", BridgeArgs{std::string{"ok"}});
+				(void)emitted;
 			}
-			catch (...) {}
+			catch (...)
+			{
+			}
 		};
 
-		if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-		else task();
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
 	}
 
 	static rml::qt::QColor parse_hex(const std::string& hex)
@@ -1054,8 +1478,13 @@ private:
 		unsigned int value = 0x202020;
 		if (hex.size() >= 7 && hex[0] == '#')
 		{
-			try { value = static_cast<unsigned int>(std::stoul(hex.substr(1, 6), nullptr, 16)); }
-			catch (...) {}
+			try
+			{
+				value = static_cast<unsigned int>(std::stoul(hex.substr(1, 6), nullptr, 16));
+			}
+			catch (...)
+			{
+			}
 		}
 		return rml::qt::QColor(static_cast<int>((value >> 16) & 0xFF),
 		                       static_cast<int>((value >> 8) & 0xFF),
@@ -1066,26 +1495,34 @@ private:
 	{
 		auto task = [this, image, hex, opacity, mode, out_dir, key]() {
 			namespace fs = std::filesystem;
-			std::string result, error;
+			std::string result;
+			std::string error;
 			try
 			{
 				int w = 0, h = 0;
 				for (auto* widget : rml::qt::QApplication::all_widgets())
 				{
-					if (!widget) continue;
+					if (!widget)
+					{
+						continue;
+					}
 					const char* cls = widget->class_name();
-					if (!cls) continue;
-					std::string_view sv(cls);
-					if ((sv.find("TopBar") != std::string_view::npos || sv.find("MenuBar") != std::string_view::npos) && widget->width() > w)
+					if (cls && std::string_view(cls).find("MenuBar") != std::string_view::npos && widget->width() > w)
 					{
 						w = widget->width();
 						h = widget->height();
 					}
 				}
-				if (w <= 0 || h <= 0) { w = 1920; h = 36; }
+				if (w <= 0 || h <= 0)
+				{
+					w = 1920;
+					h = 32;
+				}
 				const int W = w * 2;
 				const int H = h * 2;
-				rml::qt::QPixmap source(image);
+				std::optional<rml::qt::QPixmap> source_holder;
+				source_holder.emplace(image);
+				auto& source = *source_holder;
 				if (!source.loaded() || source.width() <= 0 || source.height() <= 0)
 				{
 					error = "Qt couldn't read the image: " + image;
@@ -1099,7 +1536,10 @@ private:
 						painter.set_render_hint(rml::qt::QPainter::SmoothPixmapTransform);
 						painter.set_opacity(std::clamp(opacity, 0.0, 1.0));
 						using Aspect = rml::qt::QPixmap::AspectMode;
-						if (mode == "Stretch") painter.draw_pixmap(rml::qt::QRect(0, 0, W, H), source.scaled(W, H, Aspect::Ignore));
+						if (mode == "Stretch")
+						{
+							painter.draw_pixmap(rml::qt::QRect(0, 0, W, H), source.scaled(W, H, Aspect::Ignore));
+						}
 						else if (mode == "Fit")
 						{
 							const auto fit = source.scaled(W, H, Aspect::Keep);
@@ -1108,7 +1548,10 @@ private:
 						else if (mode == "Tile")
 						{
 							const auto tile = source.scaled(W * 4, H, Aspect::Keep);
-							for (int x = 0; tile.width() > 0 && x < W; x += tile.width()) painter.draw_pixmap(x, 0, tile);
+							for (int x = 0; tile.width() > 0 && x < W; x += tile.width())
+							{
+								painter.draw_pixmap(x, 0, tile);
+							}
 						}
 						else
 						{
@@ -1116,35 +1559,57 @@ private:
 							painter.draw_pixmap((W - cover.width()) / 2, (H - cover.height()) / 2, cover);
 						}
 					}
+					source_holder.reset();
 					std::error_code ec;
 					const fs::path dir = from_utf8(out_dir);
 					fs::create_directories(dir, ec);
 					const fs::path file = dir / std::format("topbar_{}.png", ++m_compose_counter);
 					if (canvas.save(utf8(file)))
 					{
-						if (!m_last_compose.empty()) fs::remove(from_utf8(m_last_compose), ec);
+						if (!m_last_compose.empty())
+						{
+							fs::remove(from_utf8(m_last_compose), ec);
+						}
 						m_last_compose = utf8(file);
 						result = m_last_compose;
 					}
-					else error = "couldn't save composed image to " + utf8(file);
+					else
+					{
+						error = "couldn't save composed image to " + utf8(file);
+					}
 				}
 			}
-			catch (const std::exception& e) { error = e.what(); }
-			catch (...) { error = "unknown compose exception"; }
+			catch (const std::exception& e)
+			{
+				error = e.what();
+			}
+			catch (...)
+			{
+				error = "unknown compose exception";
+			}
 
 			auto* runtime = script_runtime();
-			if (!runtime) return;
+			if (!runtime)
+			{
+				return;
+			}
 			auto& bridge = runtime->bridge();
 			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",
 			                                     json_escape(key), json_escape(result), json_escape(error));
-			auto s1 = bridge.set_shared("studio_theme.topbar_image", json);
-			(void)s1;
-			auto s2 = bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
-			(void)s2;
+			auto stored = bridge.set_shared("studio_theme.topbar_image", json);
+			(void)stored;
+			auto emitted = bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
+			(void)emitted;
 		};
 
-		if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-		else task();
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
 	}
 
 	BridgeArgs install_image(const std::string& source_text, const std::string& content_text)
@@ -1152,9 +1617,15 @@ private:
 		namespace fs = std::filesystem;
 		std::error_code ec;
 		const fs::path source = from_utf8(source_text);
-		if (!fs::is_regular_file(source, ec)) return {std::string{}, std::string{"not found"}};
+		if (!fs::is_regular_file(source, ec))
+		{
+			return {std::string{}, std::string{"not found"}};
+		}
 		const fs::path content = from_utf8(content_text);
-		if (!fs::is_directory(content, ec)) return {std::string{}, "Studio content folder not found: " + content_text};
+		if (!fs::is_directory(content, ec))
+		{
+			return {std::string{}, "Studio content folder not found: " + content_text};
+		}
 		const fs::path folder = content / "studio_theme";
 		fs::create_directories(folder, ec);
 		const fs::path target = folder / source.filename();
@@ -1173,7 +1644,11 @@ private:
 		{
 			ec.clear();
 			fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
-			if (ec) return {std::string{}, "couldn't copy into Studio content folder: " + ec.message()};
+			if (ec)
+			{
+				return {std::string{}, "couldn't copy into Studio's content folder: " + ec.message()};
+			}
+			m_log->info("installed image {} -> {}", source_text, utf8(target));
 		}
 		return {"rbxasset://studio_theme/" + utf8(source.filename()), std::string{}};
 	}
@@ -1182,7 +1657,8 @@ private:
 	{
 		auto task = [this, images_dir = std::move(images_dir)]() {
 			namespace fs = std::filesystem;
-			std::string result_path, error;
+			std::string result_path;
+			std::string error;
 			try
 			{
 				const std::string picked = rml::qt::QFileDialog::get_open_file_name(
@@ -1200,43 +1676,76 @@ private:
 					{
 						ec.clear();
 						fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
-						if (ec) error = "couldn't copy image: " + ec.message();
+						if (ec)
+						{
+							error = "couldn't copy image into images folder: " + ec.message();
+						}
 					}
-					if (error.empty()) result_path = "images/" + utf8(source.filename());
+					if (error.empty())
+					{
+						result_path = "images/" + utf8(source.filename());
+					}
 				}
 			}
-			catch (const std::exception& e) { error = e.what(); }
-			catch (...) { error = "unknown file picker exception"; }
+			catch (const std::exception& e)
+			{
+				error = e.what();
+			}
+			catch (...)
+			{
+				error = "unknown file picker exception";
+			}
 
 			auto* runtime = script_runtime();
-			if (!runtime) return;
+			if (!runtime)
+			{
+				return;
+			}
 			auto& bridge = runtime->bridge();
 			const std::string json = std::format("{{\"path\":\"{}\",\"error\":\"{}\"}}",
 			                                     json_escape(result_path), json_escape(error));
-			auto s1 = bridge.set_shared("studio_theme.picked_image", json);
-			(void)s1;
-			auto s2 = bridge.emit("studio_theme.picked_image_done", BridgeArgs{std::string{"ok"}});
-			(void)s2;
+			auto stored = bridge.set_shared("studio_theme.picked_image", json);
+			(void)stored;
+			auto emitted = bridge.emit("studio_theme.picked_image_done", BridgeArgs{std::string{"ok"}});
+			(void)emitted;
 		};
 
-		if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-		else task();
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
 	}
 
 	static std::string widget_style_sheet(rml::qt::QWidget* widget)
 	{
 #ifdef _WIN32
-		if (!widget) return {};
+		if (!widget)
+		{
+			return {};
+		}
 		using Getter = void* (*)(const void* self, void* ret);
 		static const Getter getter = []() -> Getter {
 			HMODULE module = GetModuleHandleW(L"Qt5Widgets.dll");
-			if (!module) return nullptr;
+			if (!module)
+			{
+				return nullptr;
+			}
 			return reinterpret_cast<Getter>(GetProcAddress(module, "?styleSheet@QWidget@@QEBA?AVQString@@XZ"));
 		}();
-		if (!getter) return {};
+		if (!getter)
+		{
+			return {};
+		}
 
 		rml::qt::QString result;
-		if (!safe_invoke_getter(reinterpret_cast<void*>(getter), widget, result.storage())) return {};
+		if (!safe_invoke_getter(reinterpret_cast<void*>(getter), widget, result.storage()))
+		{
+			return {};
+		}
 		return result.to_utf8();
 #else
 		(void)widget;
@@ -1244,125 +1753,231 @@ private:
 #endif
 	}
 
-	static std::string strip_ours(const std::string& sheet)
+	static std::string strip_ours(std::string_view sheet)
 	{
 		const auto begin = sheet.find(kBegin);
-		if (begin == std::string::npos) return sheet;
+		if (begin == std::string_view::npos)
+		{
+			return std::string(sheet);
+		}
 		const auto end = sheet.find(kEnd, begin);
-		if (end == std::string::npos) return sheet.substr(0, begin);
-		return sheet.substr(0, begin) + sheet.substr(end + kEnd.size());
+		if (end == std::string_view::npos)
+		{
+			return std::string(sheet.substr(0, begin));
+		}
+		std::string out;
+		out.reserve(sheet.size() - (end + kEnd.size() - begin));
+		out.append(sheet.substr(0, begin));
+		out.append(sheet.substr(end + kEnd.size()));
+		return out;
 	}
 
-	void restyle_widgets_now(const std::string& css, const std::string& allow_text, const std::string& leaf_css)
+	static bool blank(const std::string& text)
+	{
+		return std::all_of(text.begin(), text.end(), [](char ch) {
+			return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+		});
+	}
+
+	static std::string make_block(const std::string& css)
+	{
+		std::string block;
+		block.reserve(kBegin.size() + css.size() + kEnd.size());
+		block.append(kBegin);
+		block.append(css);
+		block.append(kEnd);
+		return block;
+	}
+
+	// True when `own` is already <clean base> + block, so no rewrite is needed.
+	static bool already_styled(const std::string& own, const std::string& block)
+	{
+		if (own.size() < block.size())
+		{
+			return false;
+		}
+		const std::size_t tail = own.size() - block.size();
+		return own.compare(tail, std::string::npos, block) == 0 && own.find(kBegin) == tail;
+	}
+
+	void restyle_widgets_now(std::shared_ptr<const RestyleSpec> spec)
 	{
 		auto alive = m_alive;
-		auto task = [this, alive, css, allow_text, leaf_css]() {
-			if (!alive->load()) return;
+		auto task = [this, alive, spec = std::move(spec)]() {
+			if (!alive->load())
+			{
+				return;
+			}
 			try
 			{
-				std::set<std::string> allow;
-				{
-					std::istringstream lines(allow_text.empty() ? std::string(kDefaultAllow) : allow_text);
-					std::string line;
-					while (std::getline(lines, line))
-					{
-						if (!line.empty() && line.back() == '\r') line.pop_back();
-						if (!line.empty()) allow.insert(line);
-					}
-				}
+				const auto& allow = spec->allow;
 				for (auto* widget : rml::qt::QApplication::all_widgets())
 				{
-					if (!widget) continue;
+					if (!widget)
+					{
+						continue;
+					}
 					const char* cls = widget->class_name();
-					if (!cls || !*cls) continue;
+					if (!cls || !*cls)
+					{
+						continue;
+					}
 
-					std::string_view clsView(cls);
+					const std::string_view clsView(cls);
 					const bool isMenu = (clsView.find("Menu") != std::string_view::npos && clsView.find("MenuBar") == std::string_view::npos);
-					const bool isTopBar = (clsView.find("TopBar") != std::string_view::npos);
-					const bool listed = allow.count(cls) > 0;
-					const bool isInput = !isMenu && !isTopBar && !listed && !leaf_css.empty() && looks_like_input(clsView);
-					const bool allowed = !css.empty() && (listed || isMenu || isTopBar || isInput);
-					const std::string& applied = isInput ? leaf_css : css;
+					const bool listed = allow.find(clsView) != allow.end();
+					// Input boxes (Properties filter etc.) get the small color-only sheet: it's cheap
+					// and reaches inputs whose class name isn't known. Anything on the allow list or
+					// menu-like keeps the full sheet.
+					const bool isInput = !isMenu && !listed && spec->has_leaf && looks_like_input(clsView);
+					const bool allowed = spec->has_css && (listed || isMenu || isInput);
+					const std::string& block = isInput ? spec->leaf_block : spec->css_block;
 
 					const std::string own = widget_style_sheet(widget);
 
 					if (!allowed)
 					{
-						if (!own.empty())
+						if (!own.empty() && own.find(kBegin) != std::string::npos)
 						{
-							const std::string base = strip_ours(own);
-							if (base != own) widget->setStyleSheet(rml::qt::QString(base));
+							widget->setStyleSheet(rml::qt::QString(strip_ours(own)));
 						}
 						continue;
 					}
 
-					const std::string base = own.empty() ? "" : strip_ours(own);
-					const std::string want = base.empty() ? (std::string(kBegin) + applied + std::string(kEnd))
-					                                      : (base + std::string(kBegin) + applied + std::string(kEnd));
+					if (already_styled(own, block))
+					{
+						continue;
+					}
+
+					// Ensure menus and dropdowns are themed directly even if they had no prior stylesheet
+					std::string want = own.empty() ? std::string() : strip_ours(own);
+					want.append(block);
 					if (want != own)
 					{
 						widget->setStyleSheet(rml::qt::QString(want));
 					}
 				}
 			}
-			catch (...) {}
+			catch (...)
+			{
+			}
 		};
 
-		if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-		else task();
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
 	}
 
 	void schedule_restyle(std::string css, std::string allow_text, std::string leaf_css)
 	{
+		auto spec = std::make_shared<RestyleSpec>();
+		spec->has_css = !css.empty();
+		spec->has_leaf = !leaf_css.empty();
+		if (spec->has_css)
+		{
+			spec->css_block = make_block(css);
+		}
+		if (spec->has_leaf)
+		{
+			spec->leaf_block = make_block(leaf_css);
+		}
+		{
+			std::istringstream lines(allow_text.empty() ? std::string(kDefaultAllow) : std::move(allow_text));
+			std::string line;
+			while (std::getline(lines, line))
+			{
+				if (!line.empty() && line.back() == '\r')
+				{
+					line.pop_back();
+				}
+				if (!line.empty())
+				{
+					spec->allow.insert(line);
+				}
+			}
+		}
+		std::shared_ptr<const RestyleSpec> shared = std::move(spec);
 		{
 			std::lock_guard lock(m_mutex);
-			m_restyle_css = css;
-			m_restyle_allow = allow_text;
-			m_restyle_leaf = leaf_css;
+			m_restyle = shared;
 		}
-		restyle_widgets_now(css, allow_text, leaf_css);
+		restyle_widgets_now(std::move(shared));
 	}
 
 	void schedule(std::string css)
 	{
 		auto alive = m_alive;
 		auto task = [this, alive, css = std::move(css)]() {
-			if (!alive->load()) return;
+			if (!alive->load())
+			{
+				return;
+			}
 			apply_now(css);
 		};
 
-		if (auto* qt = rml::qt::QtIntegration::instance()) qt->run_on_gui_thread(task);
-		else task();
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(task);
+		}
+		else
+		{
+			task();
+		}
 	}
 
 	void apply_now(const std::string& css)
 	{
 		std::lock_guard lock(m_mutex);
-		try { apply_locked(css); } catch (...) {}
+		try
+		{
+			apply_locked(css);
+		}
+		catch (...)
+		{
+		}
 	}
 
 	void apply_locked(const std::string& css)
 	{
 		auto* app = rml::qt::QApplication::instance();
-		if (!app) return;
+		if (!app)
+		{
+			return;
+		}
 		const std::string current = app->style_sheet();
 		const std::size_t mark = current.find(kSheetMarker);
 		if (!m_captured || mark == std::string::npos)
 		{
 			std::string baseline = (mark == std::string::npos) ? current : current.substr(0, mark);
-			if (mark != std::string::npos && !baseline.empty() && baseline.back() == '\n') baseline.pop_back();
+			if (mark != std::string::npos && !baseline.empty() && baseline.back() == '\n')
+			{
+				baseline.pop_back();
+			}
 			m_original = std::move(baseline);
 			m_captured = true;
 		}
 		m_wanted = !css.empty();
 		m_css = css;
-		const std::string full = css.empty() ? m_original : m_original + "\n" + kSheetMarker + "\n" + css;
-		if (current == full)
+		if (css.empty())
 		{
-			m_last = full;
+			if (current != m_original)
+			{
+				app->set_style_sheet(m_original);
+			}
 			return;
 		}
-		m_last = full;
+		std::string full;
+		full.reserve(m_original.size() + kSheetMarker.size() + css.size() + 2);
+		full.append(m_original).append("\n").append(kSheetMarker).append("\n").append(css);
+		if (current == full)
+		{
+			return;
+		}
 		app->set_style_sheet(full);
 	}
 };

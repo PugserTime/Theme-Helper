@@ -66,7 +66,7 @@ using namespace rml::luau;
 namespace
 {
 #ifndef STUDIO_THEME_HELPER_BASE
-#define STUDIO_THEME_HELPER_BASE "1.4"
+#define STUDIO_THEME_HELPER_BASE "1.3"
 #endif
 #ifndef STUDIO_THEME_HELPER_VERSION
 #define STUDIO_THEME_HELPER_VERSION STUDIO_THEME_HELPER_BASE ".0"
@@ -479,7 +479,7 @@ class studio_theme_qt final : public ModBase
 	bool m_have_presets = false;
 	int m_compose_counter = 0;
 	std::string m_last_compose;
-	std::map<std::string, std::string> m_panel_files;
+	std::map<std::string, std::string> m_compose_by_key;
 
 	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
 	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
@@ -495,7 +495,7 @@ public:
 	{
 		name = "Studio Theme Qt";
 		version = kHelperVersion;
-		author = "gasolongames";
+		author = "Studio Theme";
 		description = "Qt stylesheet helper + updater for the Studio Theme mod";
 		m_log = rml::Logger::get_logger("StudioThemeQt");
 	}
@@ -835,7 +835,7 @@ public:
 						opacity = *d;
 					}
 				}
-				schedule_compose(text(0), text(1), opacity, text(3), text(4), text(5));
+				schedule_compose(text(0), text(1), opacity, text(3), text(4), text(5), text(6));
 				return {true};
 			}
 			catch (...)
@@ -844,41 +844,6 @@ public:
 			}
 		});
 		(void)r13;
-
-		// compose_panel(image, hex, opacity, mode, outDir, key, targetClass)
-		// Like compose_topbar, but sized to the largest live widget whose class name contains
-		// `targetClass`, written to its own file per key (so several panels can each keep an
-		// image), and reported through studio_theme.panel_ready with the result as the event arg.
-		auto r13b = bridge.register_function("studio_theme_qt", "compose_panel", [this](const BridgeArgs& args) -> BridgeArgs {
-			try
-			{
-				auto text = [&](std::size_t i) -> std::string {
-					if (i < args.size())
-					{
-						if (const auto* v = std::get_if<std::string>(&args[i]))
-						{
-							return *v;
-						}
-					}
-					return {};
-				};
-				double opacity = 1.0;
-				if (args.size() > 2)
-				{
-					if (const auto* d = std::get_if<double>(&args[2]))
-					{
-						opacity = *d;
-					}
-				}
-				schedule_compose_panel(text(0), text(1), opacity, text(3), text(4), text(5), text(6));
-				return {true};
-			}
-			catch (...)
-			{
-				return {false};
-			}
-		});
-		(void)r13b;
 
 		auto r14 = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
 			try
@@ -967,7 +932,7 @@ public:
 				auto& bridge = runtime->bridge();
 				for (const char* fn : {"version", "check_update", "download_update", "install_pending", "ping", "abi",
 				                       "save_theme", "load_theme", "apply", "scan", "pick_image", "install_image",
-				                       "compose_topbar", "compose_panel", "set_presets", "restyle_widgets"})
+				                       "compose_topbar", "set_presets", "restyle_widgets"})
 				{
 					try
 					{
@@ -1527,9 +1492,9 @@ private:
 		                       static_cast<int>(value & 0xFF));
 	}
 
-	void schedule_compose(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir, std::string key)
+	void schedule_compose(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir, std::string key, std::string size_class = {})
 	{
-		auto task = [this, image, hex, opacity, mode, out_dir, key]() {
+		auto task = [this, image, hex, opacity, mode, out_dir, key, size_class]() {
 			namespace fs = std::filesystem;
 			std::string result;
 			std::string error;
@@ -1543,7 +1508,9 @@ private:
 						continue;
 					}
 					const char* cls = widget->class_name();
-					if (cls && std::string_view(cls).find("MenuBar") != std::string_view::npos && widget->width() > w)
+					// size to the panel this image is for (Output, Properties...), else the menu bar
+					const std::string_view want = size_class.empty() ? std::string_view("MenuBar") : std::string_view(size_class);
+					if (cls && std::string_view(cls).find(want) != std::string_view::npos && widget->width() * widget->height() > w * h)
 					{
 						w = widget->width();
 						h = widget->height();
@@ -1602,10 +1569,14 @@ private:
 					const fs::path file = dir / std::format("topbar_{}.png", ++m_compose_counter);
 					if (canvas.save(utf8(file)))
 					{
-						if (!m_last_compose.empty())
+						// one file per key: composing the Output image must not delete the top bar's
+						const std::string group = size_class.empty() ? std::string("topbar") : size_class;
+						auto found = m_compose_by_key.find(group);
+						if (found != m_compose_by_key.end() && !found->second.empty())
 						{
-							fs::remove(from_utf8(m_last_compose), ec);
+							fs::remove(from_utf8(found->second), ec);
 						}
+						m_compose_by_key[group] = utf8(file);
 						m_last_compose = utf8(file);
 						result = m_last_compose;
 					}
@@ -1635,136 +1606,6 @@ private:
 			auto stored = bridge.set_shared("studio_theme.topbar_image", json);
 			(void)stored;
 			auto emitted = bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
-			(void)emitted;
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
-	}
-
-	void schedule_compose_panel(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir, std::string key, std::string target)
-	{
-		auto task = [this, image, hex, opacity, mode, out_dir, key, target]() {
-			namespace fs = std::filesystem;
-			std::string result;
-			std::string error;
-			try
-			{
-				int w = 0, h = 0;
-				long long best = 0;
-				for (auto* widget : rml::qt::QApplication::all_widgets())
-				{
-					if (!widget)
-					{
-						continue;
-					}
-					const char* cls = widget->class_name();
-					if (cls && !target.empty() && std::string_view(cls).find(target) != std::string_view::npos)
-					{
-						const long long area = static_cast<long long>(widget->width()) * widget->height();
-						if (area > best)
-						{
-							best = area;
-							w = widget->width();
-							h = widget->height();
-						}
-					}
-				}
-				if (w <= 0 || h <= 0)
-				{
-					w = 640;
-					h = 360;
-				}
-				const int W = std::clamp(w * 2, 64, 4096);
-				const int H = std::clamp(h * 2, 64, 4096);
-				std::optional<rml::qt::QPixmap> source_holder;
-				source_holder.emplace(image);
-				auto& source = *source_holder;
-				if (!source.loaded() || source.width() <= 0 || source.height() <= 0)
-				{
-					error = "Qt couldn't read the image: " + image;
-				}
-				else
-				{
-					rml::qt::QPixmap canvas(W, H);
-					canvas.fill(parse_hex(hex));
-					{
-						rml::qt::QPainter painter(canvas);
-						painter.set_render_hint(rml::qt::QPainter::SmoothPixmapTransform);
-						painter.set_opacity(std::clamp(opacity, 0.0, 1.0));
-						using Aspect = rml::qt::QPixmap::AspectMode;
-						if (mode == "Stretch")
-						{
-							painter.draw_pixmap(rml::qt::QRect(0, 0, W, H), source.scaled(W, H, Aspect::Ignore));
-						}
-						else if (mode == "Fit")
-						{
-							const auto fit = source.scaled(W, H, Aspect::Keep);
-							painter.draw_pixmap((W - fit.width()) / 2, (H - fit.height()) / 2, fit);
-						}
-						else if (mode == "Tile")
-						{
-							const auto tile = source.scaled(std::max(1, W / 3), std::max(1, H / 3), Aspect::Keep);
-							for (int y = 0; tile.height() > 0 && y < H; y += tile.height())
-							{
-								for (int x = 0; tile.width() > 0 && x < W; x += tile.width())
-								{
-									painter.draw_pixmap(x, y, tile);
-								}
-							}
-						}
-						else
-						{
-							const auto cover = source.scaled(W, H, Aspect::KeepByExpanding);
-							painter.draw_pixmap((W - cover.width()) / 2, (H - cover.height()) / 2, cover);
-						}
-					}
-					source_holder.reset();
-					std::error_code ec;
-					const fs::path dir = from_utf8(out_dir);
-					fs::create_directories(dir, ec);
-					// a fresh file name every time: Qt caches stylesheet pixmaps by path
-					const fs::path file = dir / std::format("panel_{:x}_{}.png", std::hash<std::string>{}(key) & 0xFFFFFFFFu, ++m_compose_counter);
-					if (canvas.save(utf8(file)))
-					{
-						auto prev = m_panel_files.find(key);
-						if (prev != m_panel_files.end() && !prev->second.empty())
-						{
-							fs::remove(from_utf8(prev->second), ec);
-						}
-						m_panel_files[key] = utf8(file);
-						result = utf8(file);
-					}
-					else
-					{
-						error = "couldn't save composed image to " + utf8(file);
-					}
-				}
-			}
-			catch (const std::exception& e)
-			{
-				error = e.what();
-			}
-			catch (...)
-			{
-				error = "unknown compose exception";
-			}
-
-			auto* runtime = script_runtime();
-			if (!runtime)
-			{
-				return;
-			}
-			auto& bridge = runtime->bridge();
-			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",
-			                                     json_escape(key), json_escape(result), json_escape(error));
-			auto emitted = bridge.emit("studio_theme.panel_ready", BridgeArgs{json});
 			(void)emitted;
 		};
 

@@ -73,6 +73,14 @@ namespace
 #endif
 constexpr const char* kHelperVersion = STUDIO_THEME_HELPER_VERSION;
 
+// What this helper can do, by name. The scripts ask for these instead of comparing version numbers
+// (version numbers get reset; a capability either exists or it doesn't).
+//   compose_panel  - compose_panel() exists (cuts a picture for any panel, sized to that panel)
+//   compose_event  - the result arrives in the event payload, so several can be in flight at once
+//   compose_cache  - finished cuts are kept on disk and reused (no re-cutting after a restart)
+//   compose_native - pictures are cut at 1x (native size), for unscaled background-image
+constexpr const char* kCapabilities = "compose_panel compose_event compose_cache compose_native";
+
 #ifdef RML_ABI_VERSION
 constexpr int kBuiltAbi = RML_ABI_VERSION;
 #else
@@ -447,6 +455,72 @@ int parse_tag_abi(const std::string& tag)
 	}
 }
 
+// ---- compose helpers begin (pure functions; unit-tested on their own) ----
+
+// Stable 64-bit FNV-1a, hex. Names a finished cut after everything that shapes it, so the same
+// picture / color / strength / mode / size always lands on the same file and is reused.
+std::string fnv1a_hex(std::string_view text)
+{
+	std::uint64_t h = 14695981039346656037ull;
+	for (const unsigned char c : text)
+	{
+		h ^= c;
+		h *= 1099511628211ull;
+	}
+	return std::format("{:016x}", h);
+}
+
+// "MenuBar|TopBar" -> {"MenuBar", "TopBar"} (empty pieces dropped)
+std::vector<std::string_view> split_classes(std::string_view list)
+{
+	std::vector<std::string_view> out;
+	std::size_t start = 0;
+	while (start <= list.size())
+	{
+		std::size_t bar = list.find('|', start);
+		if (bar == std::string_view::npos)
+		{
+			bar = list.size();
+		}
+		const auto piece = list.substr(start, bar - start);
+		if (!piece.empty())
+		{
+			out.push_back(piece);
+		}
+		start = bar + 1;
+	}
+	return out;
+}
+
+// A file-name-safe group name from a class list ("RBX::Studio::X|Y" -> "RBX__Studio__X_Y")
+std::string safe_group(std::string_view text)
+{
+	std::string out;
+	for (const char ch : text)
+	{
+		const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_';
+		out.push_back(ok ? ch : '_');
+	}
+	return out.empty() ? std::string("panel") : out;
+}
+
+// Of the cuts already on disk for a group, the file names to delete so that only `keep_count`
+// (newest first) stay. `current` is never listed.
+std::vector<std::string> cuts_to_delete(std::vector<std::pair<std::int64_t, std::string>> files, const std::string& current, std::size_t keep_count)
+{
+	std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	std::vector<std::string> out;
+	for (std::size_t i = keep_count; i < files.size(); ++i)
+	{
+		if (files[i].second != current)
+		{
+			out.push_back(files[i].second);
+		}
+	}
+	return out;
+}
+// ---- compose helpers end ----
+
 } // namespace
 
 struct RestyleSpec
@@ -477,9 +551,6 @@ class studio_theme_qt final : public ModBase
 	std::vector<uint64_t> m_preset_items;
 	std::size_t m_last_presets_hash = 0;
 	bool m_have_presets = false;
-	int m_compose_counter = 0;
-	std::string m_last_compose;
-	std::map<std::string, std::string> m_compose_by_key;
 
 	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
 	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
@@ -589,6 +660,18 @@ public:
 		}
 		auto& bridge = runtime->bridge();
 
+		// string argument `i` of a call, or empty
+		auto text_arg = [](const BridgeArgs& args, std::size_t i) -> std::string {
+			if (i < args.size())
+			{
+				if (const auto* v = std::get_if<std::string>(&args[i]))
+				{
+					return *v;
+				}
+			}
+			return {};
+		};
+
 		// Core & updater functions (zero Qt dependencies)
 		auto r1 = bridge.register_function("studio_theme_qt", "ping", [](const BridgeArgs&) -> BridgeArgs {
 			return {true};
@@ -605,34 +688,19 @@ public:
 		});
 		(void)r3;
 
-		auto r4 = bridge.register_function("studio_theme_qt", "check_update", [this](const BridgeArgs& args) -> BridgeArgs {
-			auto text = [&](std::size_t i) -> std::string {
-				if (i < args.size())
-				{
-					if (const auto* v = std::get_if<std::string>(&args[i]))
-					{
-						return *v;
-					}
-				}
-				return {};
-			};
-			start_check(text(0), text(1), text(2));
+		auto r3b = bridge.register_function("studio_theme_qt", "capabilities", [](const BridgeArgs&) -> BridgeArgs {
+			return {std::string{kCapabilities}};
+		});
+		(void)r3b;
+
+		auto r4 = bridge.register_function("studio_theme_qt", "check_update", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
+			start_check(text_arg(args, 0), text_arg(args, 1), text_arg(args, 2));
 			return {true};
 		});
 		(void)r4;
 
-		auto r5 = bridge.register_function("studio_theme_qt", "download_update", [this](const BridgeArgs& args) -> BridgeArgs {
-			auto text = [&](std::size_t i) -> std::string {
-				if (i < args.size())
-				{
-					if (const auto* v = std::get_if<std::string>(&args[i]))
-					{
-						return *v;
-					}
-				}
-				return {};
-			};
-			start_download(text(0), text(1), text(2));
+		auto r5 = bridge.register_function("studio_theme_qt", "download_update", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
+			start_download(text_arg(args, 0), text_arg(args, 1), text_arg(args, 2));
 			return {true};
 		});
 		(void)r5;
@@ -741,18 +809,10 @@ public:
 		(void)r8;
 
 		// Qt styling functions
-		auto r9 = bridge.register_function("studio_theme_qt", "apply", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r9 = bridge.register_function("studio_theme_qt", "apply", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
-				std::string css;
-				if (!args.empty())
-				{
-					if (const auto* text = std::get_if<std::string>(&args[0]))
-					{
-						css = *text;
-					}
-				}
-				schedule(std::move(css));
+				schedule(text_arg(args, 0));
 				return {true};
 			}
 			catch (...)
@@ -775,18 +835,10 @@ public:
 		});
 		(void)r10;
 
-		auto r11 = bridge.register_function("studio_theme_qt", "pick_image", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r11 = bridge.register_function("studio_theme_qt", "pick_image", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
-				std::string dir;
-				if (!args.empty())
-				{
-					if (const auto* text = std::get_if<std::string>(&args[0]))
-					{
-						dir = *text;
-					}
-				}
-				schedule_pick(std::move(dir));
+				schedule_pick(text_arg(args, 0));
 				return {true};
 			}
 			catch (...)
@@ -814,49 +866,41 @@ public:
 		});
 		(void)r12;
 
-		auto r13 = bridge.register_function("studio_theme_qt", "compose_topbar", [this](const BridgeArgs& args) -> BridgeArgs {
-			try
-			{
-				auto text = [&](std::size_t i) -> std::string {
-					if (i < args.size())
+		// compose_topbar / compose_panel(image, "#RRGGBB", opacity, mode, outDir, key [, classes])
+		// Cuts the picture to the size of the widget(s) it is for, blended onto the color, and answers
+		// (event payload + shared slot) with {key, path, error}. Same cutter; the only difference is
+		// which event answers: compose_topbar -> topbar_ready, compose_panel -> panel_ready.
+		auto make_composer = [this, text_arg](bool panel) {
+			return [this, text_arg, panel](const BridgeArgs& args) -> BridgeArgs {
+				try
+				{
+					double opacity = 1.0;
+					if (args.size() > 2)
 					{
-						if (const auto* v = std::get_if<std::string>(&args[i]))
+						if (const auto* d = std::get_if<double>(&args[2]))
 						{
-							return *v;
+							opacity = *d;
 						}
 					}
-					return {};
-				};
-				double opacity = 1.0;
-				if (args.size() > 2)
-				{
-					if (const auto* d = std::get_if<double>(&args[2]))
-					{
-						opacity = *d;
-					}
+					schedule_compose(text_arg(args, 0), text_arg(args, 1), opacity, text_arg(args, 3), text_arg(args, 4),
+					                 text_arg(args, 5), text_arg(args, 6), panel);
+					return {true};
 				}
-				schedule_compose(text(0), text(1), opacity, text(3), text(4), text(5), text(6));
-				return {true};
-			}
-			catch (...)
-			{
-				return {false};
-			}
-		});
+				catch (...)
+				{
+					return {false};
+				}
+			};
+		};
+		auto r13 = bridge.register_function("studio_theme_qt", "compose_topbar", make_composer(false));
 		(void)r13;
+		auto r13b = bridge.register_function("studio_theme_qt", "compose_panel", make_composer(true));
+		(void)r13b;
 
-		auto r14 = bridge.register_function("studio_theme_qt", "set_presets", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r14 = bridge.register_function("studio_theme_qt", "set_presets", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
-				std::string names;
-				if (!args.empty())
-				{
-					if (const auto* text = std::get_if<std::string>(&args[0]))
-					{
-						names = *text;
-					}
-				}
-				schedule_presets(std::move(names));
+				schedule_presets(text_arg(args, 0));
 				return {true};
 			}
 			catch (...)
@@ -866,34 +910,10 @@ public:
 		});
 		(void)r14;
 
-		auto r15 = bridge.register_function("studio_theme_qt", "restyle_widgets", [this](const BridgeArgs& args) -> BridgeArgs {
+		auto r15 = bridge.register_function("studio_theme_qt", "restyle_widgets", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
 			try
 			{
-				std::string css;
-				std::string allow;
-				std::string leaf;
-				if (args.size() > 0)
-				{
-					if (const auto* text = std::get_if<std::string>(&args[0]))
-					{
-						css = *text;
-					}
-				}
-				if (args.size() > 1)
-				{
-					if (const auto* text = std::get_if<std::string>(&args[1]))
-					{
-						allow = *text;
-					}
-				}
-				if (args.size() > 2)
-				{
-					if (const auto* text = std::get_if<std::string>(&args[2]))
-					{
-						leaf = *text;
-					}
-				}
-				schedule_restyle(std::move(css), std::move(allow), std::move(leaf));
+				schedule_restyle(text_arg(args, 0), text_arg(args, 1), text_arg(args, 2));
 				return {true};
 			}
 			catch (...)
@@ -931,8 +951,8 @@ public:
 			{
 				auto& bridge = runtime->bridge();
 				for (const char* fn : {"version", "check_update", "download_update", "install_pending", "ping", "abi",
-				                       "save_theme", "load_theme", "apply", "scan", "pick_image", "install_image",
-				                       "compose_topbar", "set_presets", "restyle_widgets"})
+				                       "capabilities", "save_theme", "load_theme", "apply", "scan", "pick_image",
+				                       "install_image", "compose_topbar", "compose_panel", "set_presets", "restyle_widgets"})
 				{
 					try
 					{
@@ -1009,10 +1029,26 @@ private:
 		}).detach();
 	}
 
-	void publish(const char* key, const char* event, std::string json)
+	// Runs `task` on Qt's GUI thread (or right here when Qt isn't up).
+	void on_gui_thread(std::function<void()> task)
+	{
+		if (auto* qt = rml::qt::QtIntegration::instance())
+		{
+			qt->run_on_gui_thread(std::move(task));
+		}
+		else
+		{
+			task();
+		}
+	}
+
+	// Hands a JSON result to the scripts: shared slot + event. `payload` goes out as the event
+	// argument too, so a script can take the result from the event itself and several results can
+	// be in flight at once (a shared slot only keeps the newest).
+	void publish(const char* key, const char* event, std::string json, bool as_payload = false)
 	{
 		auto alive = m_alive;
-		auto task = [this, alive, key, event, json = std::move(json)]() {
+		auto task = [this, alive, key, event, as_payload, json = std::move(json)]() {
 			if (!alive->load())
 			{
 				return;
@@ -1027,7 +1063,7 @@ private:
 				auto& bridge = runtime->bridge();
 				auto stored = bridge.set_shared(key, json);
 				(void)stored;
-				auto emitted = bridge.emit(event, BridgeArgs{std::string{"ok"}});
+				auto emitted = bridge.emit(event, BridgeArgs{std::string{as_payload ? json : std::string{"ok"}}});
 				(void)emitted;
 			}
 			catch (...)
@@ -1037,18 +1073,10 @@ private:
 
 		try
 		{
-			if (auto* qt = rml::qt::QtIntegration::instance())
-			{
-				qt->run_on_gui_thread(task);
-			}
-			else
-			{
-				task();
-			}
+			on_gui_thread(std::move(task));
 		}
 		catch (...)
 		{
-			task();
 		}
 	}
 
@@ -1371,7 +1399,7 @@ private:
 
 	void schedule_presets(std::string names)
 	{
-		auto task = [this, names = std::move(names)]() {
+		on_gui_thread([this, names = std::move(names)]() {
 			try
 			{
 				auto* qt = rml::qt::QtIntegration::instance();
@@ -1410,21 +1438,12 @@ private:
 			catch (...)
 			{
 			}
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
+		});
 	}
 
 	void schedule_scan()
 	{
-		auto task = [this]() {
+		on_gui_thread([this]() {
 			try
 			{
 				std::map<std::string, int> counts;
@@ -1462,16 +1481,7 @@ private:
 			catch (...)
 			{
 			}
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
+		});
 	}
 
 	static rml::qt::QColor parse_hex(const std::string& hex)
@@ -1492,15 +1502,57 @@ private:
 		                       static_cast<int>(value & 0xFF));
 	}
 
-	void schedule_compose(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir, std::string key, std::string size_class = {})
+	// Removes the group's old cuts, keeping the newest few (and `current`).
+	static void prune_cuts(const std::filesystem::path& dir, const std::string& group, const std::filesystem::path& current)
 	{
-		auto task = [this, image, hex, opacity, mode, out_dir, key, size_class]() {
+		namespace fs = std::filesystem;
+		std::error_code ec;
+		std::vector<std::pair<std::int64_t, std::string>> files;
+		const std::string prefix = group + "_";
+		for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+		{
+			const std::string name = utf8(it->path().filename());
+			if (name.rfind(prefix, 0) == 0 && it->path().extension() == ".bmp")
+			{
+				std::error_code te;
+				const auto when = it->last_write_time(te).time_since_epoch().count();
+				files.emplace_back(static_cast<std::int64_t>(when), name);
+			}
+		}
+		for (const auto& name : cuts_to_delete(std::move(files), utf8(current.filename()), 6))
+		{
+			std::error_code re;
+			fs::remove(dir / from_utf8(name), re);
+		}
+	}
+
+	// Cuts `image` to the widgets named in `size_class` ("A|B": the biggest width and the biggest
+	// height among them, so one picture covers every one of them), blended onto `hex` at `opacity`.
+	// Native size (1x): the scripts draw it unscaled, so it can never stretch. The result is a BMP
+	// (no compression: far quicker to write than PNG) named after everything that shapes it, so an
+	// identical request is answered from disk without cutting again - also after a restart.
+	void schedule_compose(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir,
+	                      std::string key, std::string size_class, bool panel)
+	{
+		auto alive = m_alive;
+		on_gui_thread([this, alive, image = std::move(image), hex = std::move(hex), opacity, mode = std::move(mode),
+		               out_dir = std::move(out_dir), key = std::move(key), size_class = std::move(size_class), panel]() {
+			if (!alive->load())
+			{
+				return;
+			}
 			namespace fs = std::filesystem;
 			std::string result;
 			std::string error;
 			try
 			{
-				int w = 0, h = 0;
+				const bool top_bar = size_class.empty();
+				const std::string classes = top_bar ? std::string("MenuBar|TopBar") : size_class;
+				const std::string group = top_bar ? std::string("topbar") : safe_group(size_class);
+				const auto wanted = split_classes(classes);
+
+				int w = 0;
+				int h = 0;
 				for (auto* widget : rml::qt::QApplication::all_widgets())
 				{
 					if (!widget)
@@ -1508,81 +1560,114 @@ private:
 						continue;
 					}
 					const char* cls = widget->class_name();
-					// size to the panel this image is for (Output, Properties...), else the menu bar
-					const std::string_view want = size_class.empty() ? std::string_view("MenuBar") : std::string_view(size_class);
-					if (cls && std::string_view(cls).find(want) != std::string_view::npos && widget->width() * widget->height() > w * h)
+					if (!cls)
 					{
-						w = widget->width();
-						h = widget->height();
+						continue;
+					}
+					const std::string_view name(cls);
+					for (const auto want : wanted)
+					{
+						if (name.find(want) != std::string_view::npos)
+						{
+							w = std::max(w, widget->width());
+							h = std::max(h, widget->height());
+							break;
+						}
 					}
 				}
-				if (w <= 0 || h <= 0)
+				if (w < 8 || h < 8)
 				{
-					w = 1920;
-					h = 32;
-				}
-				const int W = w * 2;
-				const int H = h * 2;
-				std::optional<rml::qt::QPixmap> source_holder;
-				source_holder.emplace(image);
-				auto& source = *source_holder;
-				if (!source.loaded() || source.width() <= 0 || source.height() <= 0)
-				{
-					error = "Qt couldn't read the image: " + image;
-				}
-				else
-				{
-					rml::qt::QPixmap canvas(W, H);
-					canvas.fill(parse_hex(hex));
+					if (top_bar)
 					{
-						rml::qt::QPainter painter(canvas);
-						painter.set_render_hint(rml::qt::QPainter::SmoothPixmapTransform);
-						painter.set_opacity(std::clamp(opacity, 0.0, 1.0));
-						using Aspect = rml::qt::QPixmap::AspectMode;
-						if (mode == "Stretch")
-						{
-							painter.draw_pixmap(rml::qt::QRect(0, 0, W, H), source.scaled(W, H, Aspect::Ignore));
-						}
-						else if (mode == "Fit")
-						{
-							const auto fit = source.scaled(W, H, Aspect::Keep);
-							painter.draw_pixmap((W - fit.width()) / 2, (H - fit.height()) / 2, fit);
-						}
-						else if (mode == "Tile")
-						{
-							const auto tile = source.scaled(W * 4, H, Aspect::Keep);
-							for (int x = 0; tile.width() > 0 && x < W; x += tile.width())
-							{
-								painter.draw_pixmap(x, 0, tile);
-							}
-						}
-						else
-						{
-							const auto cover = source.scaled(W, H, Aspect::KeepByExpanding);
-							painter.draw_pixmap((W - cover.width()) / 2, (H - cover.height()) / 2, cover);
-						}
-					}
-					source_holder.reset();
-					std::error_code ec;
-					const fs::path dir = from_utf8(out_dir);
-					fs::create_directories(dir, ec);
-					const fs::path file = dir / std::format("topbar_{}.png", ++m_compose_counter);
-					if (canvas.save(utf8(file)))
-					{
-						// one file per key: composing the Output image must not delete the top bar's
-						const std::string group = size_class.empty() ? std::string("topbar") : size_class;
-						auto found = m_compose_by_key.find(group);
-						if (found != m_compose_by_key.end() && !found->second.empty())
-						{
-							fs::remove(from_utf8(found->second), ec);
-						}
-						m_compose_by_key[group] = utf8(file);
-						m_last_compose = utf8(file);
-						result = m_last_compose;
+						w = 1920;
+						h = 36;
 					}
 					else
 					{
-						error = "couldn't save composed image to " + utf8(file);
+						error = "panel isn't on screen yet: " + size_class;
+					}
+				}
+
+				if (error.empty())
+				{
+					w = std::min(w, 8192);
+					h = std::min(h, 4096);
+					std::error_code ec;
+					const fs::path source_path = from_utf8(image);
+					const auto source_size = fs::file_size(source_path, ec);
+					ec.clear();
+					const auto source_time = fs::last_write_time(source_path, ec).time_since_epoch().count();
+					ec.clear();
+					const std::string signature =
+					    std::format("{}|{}|{}|{}|{:.3f}|{}|{}x{}", image, source_size, source_time, mode, opacity, hex, w, h);
+
+					const fs::path dir = from_utf8(out_dir);
+					fs::create_directories(dir, ec);
+					ec.clear();
+					const fs::path file = dir / std::format("{}_{}.bmp", group, fnv1a_hex(signature));
+
+					if (fs::exists(file, ec) && fs::file_size(file, ec) > 0)
+					{
+						// already cut: reuse it (and mark it fresh so pruning keeps it)
+						result = utf8(file);
+						ec.clear();
+						fs::last_write_time(file, fs::file_time_type::clock::now(), ec);
+					}
+					else
+					{
+						std::optional<rml::qt::QPixmap> source_holder;
+						source_holder.emplace(image);
+						auto& source = *source_holder;
+						if (!source.loaded() || source.width() <= 0 || source.height() <= 0)
+						{
+							error = "Qt couldn't read the image: " + image;
+						}
+						else
+						{
+							rml::qt::QPixmap canvas(w, h);
+							canvas.fill(parse_hex(hex));
+							{
+								rml::qt::QPainter painter(canvas);
+								painter.set_render_hint(rml::qt::QPainter::SmoothPixmapTransform);
+								painter.set_opacity(std::clamp(opacity, 0.0, 1.0));
+								using Aspect = rml::qt::QPixmap::AspectMode;
+								if (mode == "Stretch")
+								{
+									painter.draw_pixmap(rml::qt::QRect(0, 0, w, h), source.scaled(w, h, Aspect::Ignore));
+								}
+								else if (mode == "Fit")
+								{
+									const auto fit = source.scaled(w, h, Aspect::Keep);
+									painter.draw_pixmap((w - fit.width()) / 2, (h - fit.height()) / 2, fit);
+								}
+								else if (mode == "Tile")
+								{
+									const auto tile = source.scaled(w * 4, h, Aspect::Keep);
+									for (int x = 0; tile.width() > 0 && x < w; x += tile.width())
+									{
+										painter.draw_pixmap(x, 0, tile);
+									}
+								}
+								else
+								{
+									const auto cover = source.scaled(w, h, Aspect::KeepByExpanding);
+									painter.draw_pixmap((w - cover.width()) / 2, (h - cover.height()) / 2, cover);
+								}
+							}
+							source_holder.reset();
+							if (canvas.save(utf8(file)))
+							{
+								result = utf8(file);
+							}
+							else
+							{
+								error = "couldn't save composed image to " + utf8(file);
+							}
+						}
+					}
+					if (!result.empty())
+					{
+						prune_cuts(dir, group, file);
 					}
 				}
 			}
@@ -1595,28 +1680,11 @@ private:
 				error = "unknown compose exception";
 			}
 
-			auto* runtime = script_runtime();
-			if (!runtime)
-			{
-				return;
-			}
-			auto& bridge = runtime->bridge();
 			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",
 			                                     json_escape(key), json_escape(result), json_escape(error));
-			auto stored = bridge.set_shared("studio_theme.topbar_image", json);
-			(void)stored;
-			auto emitted = bridge.emit("studio_theme.topbar_ready", BridgeArgs{std::string{"ok"}});
-			(void)emitted;
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
+			publish(panel ? "studio_theme.panel_image" : "studio_theme.topbar_image",
+			        panel ? "studio_theme.panel_ready" : "studio_theme.topbar_ready", json, true);
+		});
 	}
 
 	BridgeArgs install_image(const std::string& source_text, const std::string& content_text)
@@ -1662,7 +1730,7 @@ private:
 
 	void schedule_pick(std::string images_dir)
 	{
-		auto task = [this, images_dir = std::move(images_dir)]() {
+		on_gui_thread([this, images_dir = std::move(images_dir)]() {
 			namespace fs = std::filesystem;
 			std::string result_path;
 			std::string error;
@@ -1715,16 +1783,7 @@ private:
 			(void)stored;
 			auto emitted = bridge.emit("studio_theme.picked_image_done", BridgeArgs{std::string{"ok"}});
 			(void)emitted;
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
+		});
 	}
 
 	static std::string widget_style_sheet(rml::qt::QWidget* widget)
@@ -1810,7 +1869,7 @@ private:
 	void restyle_widgets_now(std::shared_ptr<const RestyleSpec> spec)
 	{
 		auto alive = m_alive;
-		auto task = [this, alive, spec = std::move(spec)]() {
+		on_gui_thread([this, alive, spec = std::move(spec)]() {
 			if (!alive->load())
 			{
 				return;
@@ -1868,16 +1927,7 @@ private:
 			catch (...)
 			{
 			}
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
+		});
 	}
 
 	void schedule_restyle(std::string css, std::string allow_text, std::string leaf_css)
@@ -1919,22 +1969,13 @@ private:
 	void schedule(std::string css)
 	{
 		auto alive = m_alive;
-		auto task = [this, alive, css = std::move(css)]() {
+		on_gui_thread([this, alive, css = std::move(css)]() {
 			if (!alive->load())
 			{
 				return;
 			}
 			apply_now(css);
-		};
-
-		if (auto* qt = rml::qt::QtIntegration::instance())
-		{
-			qt->run_on_gui_thread(task);
-		}
-		else
-		{
-			task();
-		}
+		});
 	}
 
 	void apply_now(const std::string& css)

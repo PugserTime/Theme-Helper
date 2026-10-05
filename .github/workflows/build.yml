@@ -19,7 +19,8 @@
 #                                   so it never picks a DLL built for another ABI)
 #   studio_theme_helper_*.zip      (the RobloxModLoader folder layout)
 # The newest one is also at .../releases/latest/download/studio_theme_qt.dll
-# The newest 5 releases per ABI are kept; older ones are removed automatically.
+# Only the NEWEST release per ABI is kept; older ones are removed automatically, so the Releases
+# page never shows old versions. (Want a few for rollback? Raise KEEP_RELEASES below.)
 #
 # Auto-update: GitHub can't notify this repo when RML changes (it isn't your
 # repo), so a tiny Linux job "watches" RML once an hour. It reads RML's latest
@@ -419,6 +420,7 @@ jobs:
           RML_ABI: ${{ steps.rml.outputs.abi }}
           HELPER_VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
+          KEEP_RELEASES: "1" # how many releases to keep per ABI (newest first)
         run: |
           $ErrorActionPreference = "Stop"
           $tag = $env:TAG
@@ -469,12 +471,14 @@ jobs:
             "Newest build: https://github.com/$repo/releases/latest/download/studio_theme_qt.dll"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
 
-          # Keep the newest 5 releases for this ABI; remove older ones (and their tags).
+          # Keep only the newest release(s) for this ABI; remove older ones (and their tags).
           # Never fails the build: the new release is already published.
+          $keep = [int]$env:KEEP_RELEASES
+          if ($keep -lt 1) { $keep = 1 }
           try {
             $filter = "[.[] | select(.tagName | endswith(`"-abi$env:RML_ABI`"))] | sort_by(.createdAt) | reverse | .[].tagName"
             $mine = @(gh release list --limit 200 --json tagName,createdAt --jq $filter)
-            foreach ($old in ($mine | Select-Object -Skip 5)) {
+            foreach ($old in ($mine | Select-Object -Skip $keep)) {
               Write-Host "Removing old release $old"
               gh release delete $old --yes --cleanup-tag
             }

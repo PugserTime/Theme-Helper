@@ -79,7 +79,8 @@ constexpr const char* kHelperVersion = STUDIO_THEME_HELPER_VERSION;
 //   compose_event  - the result arrives in the event payload, so several can be in flight at once
 //   compose_cache  - finished cuts are kept on disk and reused (no re-cutting after a restart)
 //   compose_native - pictures are cut at 1x (native size), for unscaled background-image
-constexpr const char* kCapabilities = "compose_panel compose_event compose_cache compose_native";
+//   compose_watch  - the helper re-cuts a picture by itself when its panel is resized
+constexpr const char* kCapabilities = "compose_panel compose_event compose_cache compose_native compose_watch";
 
 #ifdef RML_ABI_VERSION
 constexpr int kBuiltAbi = RML_ABI_VERSION;
@@ -519,6 +520,45 @@ std::vector<std::string> cuts_to_delete(std::vector<std::pair<std::int64_t, std:
 	}
 	return out;
 }
+// What a watched panel looked like when it was last cut, and what we saw on the previous check.
+struct CutSize
+{
+	int w = -1;
+	int h = -1;
+	int pend_w = -1;
+	int pend_h = -1;
+};
+enum class CutStep
+{
+	Nothing, // up to date (or the panel isn't on screen)
+	Wait,    // the size just changed: wait one more check to see whether it settles
+	Recut    // changed and held still for a whole check: cut it again now
+};
+// Called on every check with the size the panel has now. Waiting one check (~0.3 s) means dragging
+// a splitter doesn't re-cut on every pixel, but the picture is fixed as soon as you let go.
+CutStep next_cut_step(CutSize& s, int w, int h)
+{
+	if (w < 8 || h < 8)
+	{
+		s.pend_w = s.pend_h = -1;
+		return CutStep::Nothing;
+	}
+	if (w == s.w && h == s.h)
+	{
+		s.pend_w = s.pend_h = -1;
+		return CutStep::Nothing;
+	}
+	if (w != s.pend_w || h != s.pend_h)
+	{
+		s.pend_w = w;
+		s.pend_h = h;
+		return CutStep::Wait;
+	}
+	s.pend_w = s.pend_h = -1;
+	s.w = w;
+	s.h = h;
+	return CutStep::Recut;
+}
 // ---- compose helpers end ----
 
 } // namespace
@@ -551,6 +591,17 @@ class studio_theme_qt final : public ModBase
 	std::vector<uint64_t> m_preset_items;
 	std::size_t m_last_presets_hash = 0;
 	bool m_have_presets = false;
+
+	// Every picture we cut, by panel, so a resize can re-cut it (GUI thread only).
+	struct CutRequest
+	{
+		std::string image, hex, mode, out_dir, key, size_class, classes;
+		double opacity = 1.0;
+		bool panel = false;
+		CutSize size;
+	};
+	std::map<std::string, CutRequest> m_cuts;
+	std::atomic<bool> m_watch_cuts{false};
 
 	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
 	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
@@ -1288,24 +1339,36 @@ private:
 	void start_watchdog()
 	{
 		std::thread([this, alive = m_alive]() {
+			int tick = 0;
 			while (alive->load() && !m_stop)
 			{
-				for (int i = 0; i < 20 && alive->load() && !m_stop; ++i)
-				{
-					std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				if (!alive->load() || m_stop)
 				{
 					return;
 				}
-				auto task = [this, alive]() {
+				++tick;
+				const bool resize_check = tick % 3 == 0 && m_watch_cuts.load();
+				const bool reassert_check = tick % 20 == 0;
+				if (!resize_check && !reassert_check)
+				{
+					continue;
+				}
+				auto task = [this, alive, resize_check, reassert_check]() {
 					if (!alive->load())
 					{
 						return;
 					}
 					try
 					{
-						reassert();
+						if (resize_check)
+						{
+							check_cut_sizes();
+						}
+						if (reassert_check)
+						{
+							reassert();
+						}
 					}
 					catch (...)
 					{
@@ -1502,6 +1565,56 @@ private:
 		                       static_cast<int>(value & 0xFF));
 	}
 
+	// The biggest width and the biggest height among the widgets whose class contains any of `wanted`.
+	static std::pair<int, int> measure_classes(const std::vector<std::string_view>& wanted)
+	{
+		int w = 0;
+		int h = 0;
+		for (auto* widget : rml::qt::QApplication::all_widgets())
+		{
+			if (!widget)
+			{
+				continue;
+			}
+			const char* cls = widget->class_name();
+			if (!cls)
+			{
+				continue;
+			}
+			const std::string_view name(cls);
+			for (const auto want : wanted)
+			{
+				if (name.find(want) != std::string_view::npos)
+				{
+					w = std::max(w, widget->width());
+					h = std::max(h, widget->height());
+					break;
+				}
+			}
+		}
+		return {std::min(w, 8192), std::min(h, 4096)};
+	}
+
+	// Runs every ~0.3 s while something is cut: a panel that was resized (or that wasn't on screen
+	// yet when it was first cut) is cut again once its size holds still, with no help from the scripts.
+	void check_cut_sizes()
+	{
+		std::vector<CutRequest> again;
+		for (auto& entry : m_cuts)
+		{
+			CutRequest& cut = entry.second;
+			const auto size = measure_classes(split_classes(cut.classes));
+			if (next_cut_step(cut.size, size.first, size.second) == CutStep::Recut)
+			{
+				again.push_back(cut);
+			}
+		}
+		for (auto& cut : again)
+		{
+			schedule_compose(cut.image, cut.hex, cut.opacity, cut.mode, cut.out_dir, cut.key, cut.size_class, cut.panel);
+		}
+	}
+
 	// Removes the group's old cuts, keeping the newest few (and `current`).
 	static void prune_cuts(const std::filesystem::path& dir, const std::string& group, const std::filesystem::path& current)
 	{
@@ -1544,6 +1657,10 @@ private:
 			namespace fs = std::filesystem;
 			std::string result;
 			std::string error;
+			std::string cut_group;
+			std::string cut_classes;
+			int cut_w = 0;
+			int cut_h = 0;
 			try
 			{
 				const bool top_bar = size_class.empty();
@@ -1551,30 +1668,11 @@ private:
 				const std::string group = top_bar ? std::string("topbar") : safe_group(size_class);
 				const auto wanted = split_classes(classes);
 
-				int w = 0;
-				int h = 0;
-				for (auto* widget : rml::qt::QApplication::all_widgets())
-				{
-					if (!widget)
-					{
-						continue;
-					}
-					const char* cls = widget->class_name();
-					if (!cls)
-					{
-						continue;
-					}
-					const std::string_view name(cls);
-					for (const auto want : wanted)
-					{
-						if (name.find(want) != std::string_view::npos)
-						{
-							w = std::max(w, widget->width());
-							h = std::max(h, widget->height());
-							break;
-						}
-					}
-				}
+				auto size = measure_classes(wanted);
+				int w = size.first;
+				int h = size.second;
+				cut_group = group;
+				cut_classes = classes;
 				if (w < 8 || h < 8)
 				{
 					if (top_bar)
@@ -1590,8 +1688,8 @@ private:
 
 				if (error.empty())
 				{
-					w = std::min(w, 8192);
-					h = std::min(h, 4096);
+					cut_w = w;
+					cut_h = h;
 					std::error_code ec;
 					const fs::path source_path = from_utf8(image);
 					const auto source_size = fs::file_size(source_path, ec);
@@ -1678,6 +1776,26 @@ private:
 			catch (...)
 			{
 				error = "unknown compose exception";
+			}
+
+			// Remember this request so a resize re-cuts it. A failed cut is remembered with size 0, so the
+			// watcher cuts it as soon as the panel is on screen.
+			if (!cut_group.empty())
+			{
+				CutRequest& cut = m_cuts[cut_group];
+				cut.image = image;
+				cut.hex = hex;
+				cut.mode = mode;
+				cut.out_dir = out_dir;
+				cut.key = key;
+				cut.size_class = size_class;
+				cut.classes = cut_classes;
+				cut.opacity = opacity;
+				cut.panel = panel;
+				cut.size = CutSize{};
+				cut.size.w = result.empty() ? 0 : cut_w;
+				cut.size.h = result.empty() ? 0 : cut_h;
+				m_watch_cuts = true;
 			}
 
 			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",

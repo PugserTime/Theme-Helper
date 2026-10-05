@@ -80,7 +80,9 @@ constexpr const char* kHelperVersion = STUDIO_THEME_HELPER_VERSION;
 //   compose_cache  - finished cuts are kept on disk and reused (no re-cutting after a restart)
 //   compose_native - pictures are cut at 1x (native size), for unscaled background-image
 //   compose_watch  - the helper re-cuts a picture by itself when its panel is resized
-constexpr const char* kCapabilities = "compose_panel compose_event compose_cache compose_native compose_watch";
+//   images_block   - panel pictures live in a small per-widget block the helper owns (set_images keeps
+//                    the list); a new picture or a resize touches only those widgets, not the whole theme
+constexpr const char* kCapabilities = "compose_panel compose_event compose_cache compose_native compose_watch images_block";
 
 #ifdef RML_ABI_VERSION
 constexpr int kBuiltAbi = RML_ABI_VERSION;
@@ -559,6 +561,103 @@ CutStep next_cut_step(CutSize& s, int w, int h)
 	s.h = h;
 	return CutStep::Recut;
 }
+// The small block of picture rules a widget carries, kept apart from the big theme block so a new
+// picture can be swapped in without touching (or re-parsing) the theme.
+constexpr std::string_view kImgBegin = "\n/*studio_theme:img:begin*/\n";
+constexpr std::string_view kImgEnd = "\n/*studio_theme:img:end*/";
+
+// `sheet` without the block between `begin` and `end` (everything from begin to the end marker).
+std::string strip_marked(std::string_view sheet, std::string_view begin, std::string_view end)
+{
+	const auto b = sheet.find(begin);
+	if (b == std::string_view::npos)
+	{
+		return std::string(sheet);
+	}
+	const auto e = sheet.find(end, b);
+	std::string out(sheet.substr(0, b));
+	if (e != std::string_view::npos)
+	{
+		out.append(sheet.substr(e + end.size()));
+	}
+	return out;
+}
+
+// True when `own` already ends with exactly `tail` and neither block marker appears earlier - i.e. the
+// widget's sheet is already what we want and needs no rewrite.
+bool sheet_has_tail(std::string_view own, std::string_view tail, std::string_view marker_a, std::string_view marker_b)
+{
+	if (own.size() < tail.size() || own.substr(own.size() - tail.size()) != tail)
+	{
+		return false;
+	}
+	const auto head = own.substr(0, own.size() - tail.size());
+	return head.find(marker_a) == std::string_view::npos && head.find(marker_b) == std::string_view::npos;
+}
+
+// "Class<TAB>css" lines -> {class: css}. Lines without a tab are ignored.
+std::map<std::string, std::string, std::less<>> parse_image_lines(std::string_view text)
+{
+	std::map<std::string, std::string, std::less<>> out;
+	std::size_t start = 0;
+	while (start <= text.size())
+	{
+		std::size_t nl = text.find('\n', start);
+		if (nl == std::string_view::npos)
+		{
+			nl = text.size();
+		}
+		auto line = text.substr(start, nl - start);
+		if (!line.empty() && line.back() == '\r')
+		{
+			line.remove_suffix(1);
+		}
+		const auto tab = line.find('\t');
+		if (tab != std::string_view::npos && tab > 0)
+		{
+			out[std::string(line.substr(0, tab))] = std::string(line.substr(tab + 1));
+		}
+		start = nl + 1;
+	}
+	return out;
+}
+
+// Every "%PATH%" in `css` replaced by `path`.
+std::string fill_path(std::string css, std::string_view path)
+{
+	const std::string_view token = "%PATH%";
+	for (std::size_t at = css.find(token); at != std::string::npos; at = css.find(token, at + path.size()))
+	{
+		css.replace(at, token.size(), path);
+	}
+	return css;
+}
+
+// One class name per line -> set
+std::set<std::string, std::less<>> parse_class_lines(std::string_view text)
+{
+	std::set<std::string, std::less<>> out;
+	std::size_t start = 0;
+	while (start <= text.size())
+	{
+		std::size_t nl = text.find('\n', start);
+		if (nl == std::string_view::npos)
+		{
+			nl = text.size();
+		}
+		auto line = text.substr(start, nl - start);
+		if (!line.empty() && line.back() == '\r')
+		{
+			line.remove_suffix(1);
+		}
+		if (!line.empty())
+		{
+			out.emplace(std::string(line));
+		}
+		start = nl + 1;
+	}
+	return out;
+}
 // ---- compose helpers end ----
 
 } // namespace
@@ -595,13 +694,22 @@ class studio_theme_qt final : public ModBase
 	// Every picture we cut, by panel, so a resize can re-cut it (GUI thread only).
 	struct CutRequest
 	{
-		std::string image, hex, mode, out_dir, key, size_class, classes;
+		std::string image, hex, mode, out_dir, key, size_class, classes, image_template;
 		double opacity = 1.0;
 		bool panel = false;
 		CutSize size;
 	};
 	std::map<std::string, CutRequest> m_cuts;
 	std::atomic<bool> m_watch_cuts{false};
+
+	// Picture rules by widget class (guarded by m_mutex). m_keep: classes allowed to carry a picture once
+	// the scripts have said so (null = no list yet, accept everything).
+	struct ImageSpec
+	{
+		std::map<std::string, std::string, std::less<>> css;
+	};
+	std::shared_ptr<const ImageSpec> m_images;
+	std::shared_ptr<const std::set<std::string, std::less<>>> m_keep;
 
 	static constexpr std::string_view kBegin = "\n/*studio_theme:begin*/\n";
 	static constexpr std::string_view kEnd = "\n/*studio_theme:end*/";
@@ -934,7 +1042,7 @@ public:
 						}
 					}
 					schedule_compose(text_arg(args, 0), text_arg(args, 1), opacity, text_arg(args, 3), text_arg(args, 4),
-					                 text_arg(args, 5), text_arg(args, 6), panel);
+					                 text_arg(args, 5), text_arg(args, 6), panel, text_arg(args, 7));
 					return {true};
 				}
 				catch (...)
@@ -947,6 +1055,22 @@ public:
 		(void)r13;
 		auto r13b = bridge.register_function("studio_theme_qt", "compose_panel", make_composer(true));
 		(void)r13b;
+
+		// set_images(classes): which widget classes may carry a panel picture (one per line). Pictures for
+		// any other class are removed; the helper adds each picture itself when a cut finishes (and again
+		// when a panel is resized), so a changed picture never needs the theme sent again.
+		auto r13c = bridge.register_function("studio_theme_qt", "set_images", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
+			try
+			{
+				schedule_keep(text_arg(args, 0));
+				return {true};
+			}
+			catch (...)
+			{
+				return {false};
+			}
+		});
+		(void)r13c;
 
 		auto r14 = bridge.register_function("studio_theme_qt", "set_presets", [this, text_arg](const BridgeArgs& args) -> BridgeArgs {
 			try
@@ -1002,7 +1126,7 @@ public:
 			{
 				auto& bridge = runtime->bridge();
 				for (const char* fn : {"version", "check_update", "download_update", "install_pending", "ping", "abi",
-				                       "capabilities", "save_theme", "load_theme", "apply", "scan", "pick_image",
+				                       "capabilities", "set_images", "save_theme", "load_theme", "apply", "scan", "pick_image",
 				                       "install_image", "compose_topbar", "compose_panel", "set_presets", "restyle_widgets"})
 				{
 					try
@@ -1611,8 +1735,85 @@ private:
 		}
 		for (auto& cut : again)
 		{
-			schedule_compose(cut.image, cut.hex, cut.opacity, cut.mode, cut.out_dir, cut.key, cut.size_class, cut.panel);
+			schedule_compose(cut.image, cut.hex, cut.opacity, cut.mode, cut.out_dir, cut.key, cut.size_class, cut.panel, cut.image_template);
 		}
+	}
+
+	// Puts a finished cut's picture rules on the widgets that show it. `image_template` is
+	// "Class<TAB>css with %PATH%" lines; classes the scripts no longer allow are skipped.
+	void apply_cut_picture(const std::string& image_template, const std::string& path)
+	{
+		auto merged = std::make_shared<ImageSpec>();
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_images)
+			{
+				merged->css = m_images->css;
+			}
+			for (const auto& [cls, css] : parse_image_lines(image_template))
+			{
+				if (!m_keep || m_keep->find(cls) != m_keep->end())
+				{
+					merged->css[cls] = fill_path(css, path);
+				}
+			}
+			m_images = merged;
+		}
+		apply_images();
+	}
+
+	// Re-runs the per-widget pass so picture blocks are written (cheap: only changed sheets are touched).
+	void apply_images()
+	{
+		std::shared_ptr<const RestyleSpec> spec;
+		{
+			std::lock_guard lock(m_mutex);
+			spec = m_restyle;
+		}
+		if (!spec)
+		{
+			spec = std::make_shared<const RestyleSpec>();
+		}
+		restyle_widgets_now(std::move(spec));
+	}
+
+	// set_images(): the classes that may carry a picture. Others lose theirs, and a panel whose
+	// pictures are all gone stops being watched for resizes.
+	void schedule_keep(std::string text)
+	{
+		auto keep = std::make_shared<const std::set<std::string, std::less<>>>(parse_class_lines(text));
+		{
+			std::lock_guard lock(m_mutex);
+			m_keep = keep;
+			if (m_images)
+			{
+				auto kept = std::make_shared<ImageSpec>();
+				for (const auto& [cls, css] : m_images->css)
+				{
+					if (keep->find(cls) != keep->end())
+					{
+						kept->css.emplace(cls, css);
+					}
+				}
+				m_images = kept;
+			}
+		}
+		on_gui_thread([this, keep]() {
+			for (auto it = m_cuts.begin(); it != m_cuts.end();)
+			{
+				bool wanted = false;
+				for (const auto& entry : parse_image_lines(it->second.image_template))
+				{
+					if (keep->find(entry.first) != keep->end())
+					{
+						wanted = true;
+						break;
+					}
+				}
+				it = wanted ? std::next(it) : m_cuts.erase(it);
+			}
+			apply_images();
+		});
 	}
 
 	// Removes the group's old cuts, keeping the newest few (and `current`).
@@ -1645,11 +1846,12 @@ private:
 	// (no compression: far quicker to write than PNG) named after everything that shapes it, so an
 	// identical request is answered from disk without cutting again - also after a restart.
 	void schedule_compose(std::string image, std::string hex, double opacity, std::string mode, std::string out_dir,
-	                      std::string key, std::string size_class, bool panel)
+	                      std::string key, std::string size_class, bool panel, std::string image_template = {})
 	{
 		auto alive = m_alive;
 		on_gui_thread([this, alive, image = std::move(image), hex = std::move(hex), opacity, mode = std::move(mode),
-		               out_dir = std::move(out_dir), key = std::move(key), size_class = std::move(size_class), panel]() {
+		               out_dir = std::move(out_dir), key = std::move(key), size_class = std::move(size_class), panel,
+		               image_template = std::move(image_template)]() {
 			if (!alive->load())
 			{
 				return;
@@ -1792,10 +1994,18 @@ private:
 				cut.classes = cut_classes;
 				cut.opacity = opacity;
 				cut.panel = panel;
+				cut.image_template = image_template;
 				cut.size = CutSize{};
 				cut.size.w = result.empty() ? 0 : cut_w;
 				cut.size.h = result.empty() ? 0 : cut_h;
 				m_watch_cuts = true;
+			}
+
+			// A finished cut goes straight onto the widgets that show it (a tiny block each), so neither the
+			// theme nor the scripts are involved - this is what makes a resize cheap.
+			if (!result.empty() && !image_template.empty())
+			{
+				apply_cut_picture(image_template, result);
 			}
 
 			const std::string json = std::format("{{\"key\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",
@@ -1994,6 +2204,11 @@ private:
 			}
 			try
 			{
+				std::shared_ptr<const ImageSpec> images;
+				{
+					std::lock_guard lock(m_mutex);
+					images = m_images;
+				}
 				const auto& allow = spec->allow;
 				for (auto* widget : rml::qt::QApplication::all_widgets())
 				{
@@ -2017,25 +2232,43 @@ private:
 					const bool allowed = spec->has_css && (listed || isMenu || isInput);
 					const std::string& block = isInput ? spec->leaf_block : spec->css_block;
 
+					// the widget's sheet should end with: [theme block][picture block]
+					std::string picture_block;
+					if (images)
+					{
+						const auto found = images->css.find(clsView);
+						if (found != images->css.end())
+						{
+							picture_block.reserve(kImgBegin.size() + found->second.size() + kImgEnd.size());
+							picture_block.append(kImgBegin).append(found->second).append(kImgEnd);
+						}
+					}
+
 					const std::string own = widget_style_sheet(widget);
 
-					if (!allowed)
+					if (!allowed && picture_block.empty())
 					{
-						if (!own.empty() && own.find(kBegin) != std::string::npos)
+						if (!own.empty() && (own.find(kBegin) != std::string::npos || own.find(kImgBegin) != std::string::npos))
 						{
-							widget->setStyleSheet(rml::qt::QString(strip_ours(own)));
+							widget->setStyleSheet(rml::qt::QString(strip_marked(strip_marked(own, kBegin, kEnd), kImgBegin, kImgEnd)));
 						}
 						continue;
 					}
 
-					if (already_styled(own, block))
+					std::string tail;
+					if (allowed)
+					{
+						tail = block;
+					}
+					tail += picture_block;
+					if (sheet_has_tail(own, tail, kBegin, kImgBegin))
 					{
 						continue;
 					}
 
 					// Ensure menus and dropdowns are themed directly even if they had no prior stylesheet
-					std::string want = own.empty() ? std::string() : strip_ours(own);
-					want.append(block);
+					std::string want = own.empty() ? std::string() : strip_marked(strip_marked(own, kBegin, kEnd), kImgBegin, kImgEnd);
+					want.append(tail);
 					if (want != own)
 					{
 						widget->setStyleSheet(rml::qt::QString(want));
